@@ -1,4 +1,5 @@
 lgbm_output/
+ensemble_output/
 stock_cache.db
 __pycache__/
 *.pyc

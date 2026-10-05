@@ -20,6 +20,7 @@ import os
 import sqlite3
 import time
 import warnings
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -57,7 +58,9 @@ FEATURES = [
 ]
 
 
-def log(msg):
+from typing import Any, Dict, List, Tuple
+
+def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
