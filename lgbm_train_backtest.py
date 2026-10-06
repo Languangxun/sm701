@@ -15,6 +15,7 @@ LightGBM 上涨概率模型 + 训练集/验证集分段回测
 """
 import argparse
 import gc
+import glob
 import json
 import os
 import sqlite3
@@ -62,6 +63,79 @@ from typing import Any, Dict, List, Tuple
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def read_temps():
+    """读取 CPU 温度(摄氏度): coretemp/k10temp hwmon 的所有 temp*_input"""
+    vals = []
+    for h in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            with open(os.path.join(h, "name")) as f:
+                if f.read().strip() not in ("coretemp", "k10temp", "zenpower"):
+                    continue
+            for p in glob.glob(os.path.join(h, "temp*_input")):
+                try:
+                    with open(p) as f:
+                        vals.append(int(f.read()) / 1000.0)
+                except (OSError, ValueError):
+                    pass
+        except OSError:
+            pass
+    return vals
+
+
+def thermal_wait(limit=92.0, resume=85.0):
+    """温度超过 limit 时挂起等待降到 resume 以下, 返回等待秒数"""
+    t = read_temps()
+    if not t or max(t) < limit:
+        return 0.0
+    hot = max(t)
+    t0 = time.time()
+    while True:
+        time.sleep(5)
+        t = read_temps()
+        if not t or max(t) <= resume:
+            break
+    waited = time.time() - t0
+    log(f"温度 {hot:.0f}°C 超限(>{limit:.0f}), 降温 {waited:.0f}s 至 "
+        f"{max(t) if t else 0:.0f}°C 后续跑")
+    return waited
+
+
+def asof_align(left_codes, left_dates, right, right_date_col="date",
+               value_cols=None, right_code_col="code"):
+    """按 code 分组、日期 asof 对齐: 取 <= 当前日期的最近一条记录"""
+    value_cols = value_cols or [c for c in right.columns
+                                if c not in (right_code_col, right_date_col)]
+    out = np.full((len(left_codes), len(value_cols)), np.nan, dtype=np.float32)
+    right = right.sort_values([right_code_col, right_date_col])
+    pos = pd.Series(np.arange(len(left_codes))).groupby(left_codes).indices
+    for code, g in right.groupby(right_code_col, sort=False):
+        rows = pos.get(code)
+        if rows is None:
+            continue
+        j = np.searchsorted(g[right_date_col].values,
+                            left_dates[rows], side="right") - 1
+        ok = j >= 0
+        if not ok.any():
+            continue
+        vals = g[value_cols].to_numpy(np.float32)
+        out[rows[ok]] = vals[j[ok]]
+    return out
+
+
+class ThermalCallback:
+    """LightGBM 每轮回调: 节流休眠 + 温度超限自动挂起"""
+
+    def __init__(self, limit=92.0, resume=85.0, throttle=0.0, every=5):
+        self.limit, self.resume = limit, resume
+        self.throttle, self.every = throttle, every
+
+    def __call__(self, env):
+        if self.throttle > 0:
+            time.sleep(self.throttle)
+        if env.iteration % self.every == 0:
+            thermal_wait(self.limit, self.resume)
 
 
 # ---------------------------------------------------------------- 数据加载

@@ -1,5 +1,10 @@
 lgbm_output/
 ensemble_output/
-stock_cache.db
+ablation_output/
+ablation_output_v1/
+tcn_output/
+reports/
+stock_cache.db*
+*.log
 __pycache__/
 *.pyc
