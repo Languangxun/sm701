@@ -80,35 +80,75 @@ def build_margin_features(dates, codes):
 
 def build_lhb_features(dates, codes):
     log("构建龙虎榜特征 ...")
-    df = _read('SELECT code, "上榜日" AS date, "龙虎榜净买额" AS net '
-               'FROM lhb_detail')
+    df = _read('SELECT code, "上榜日" AS date, "龙虎榜净买额" AS net, '
+               '"换手率" AS turn, "净买额占总成交比" AS ratio, '
+               '"上榜原因" AS reason FROM lhb_detail')
     if df.empty:
         return None, []
-    df = df.dropna(subset=["date"])
+    df = df.dropna(subset=["date"]).copy()
     df["net"] = pd.to_numeric(df["net"], errors="coerce").fillna(0.0) / 1e8
+    df["turn"] = pd.to_numeric(df["turn"], errors="coerce").fillna(0.0)
+    df["ratio"] = pd.to_numeric(df["ratio"], errors="coerce").fillna(0.0)
+    r = df["reason"].fillna("")
+    df["f_zdf"] = r.str.contains("涨幅偏离").astype(np.float32)
+    df["f_ddf"] = r.str.contains("跌幅偏离").astype(np.float32)
+    df["f_lxup"] = (r.str.contains("连续") & r.str.contains("涨")).astype(
+        np.float32)
+    df["f_lxdn"] = (r.str.contains("连续") & r.str.contains("跌")).astype(
+        np.float32)
+    df["f_hsl"] = r.str.contains("换手率").astype(np.float32)
+    df["f_nolim"] = r.str.contains("无价格涨跌幅").astype(np.float32)
+    vcols = ["net", "turn", "ratio", "f_zdf", "f_ddf", "f_lxup", "f_lxdn",
+             "f_hsl", "f_nolim"]
     agg = df.groupby(["code", "date"], as_index=False).agg(
-        net=("net", "sum"), cnt=("net", "size"))
+        **{c: (c, "sum") for c in vcols}, cnt=("net", "size"))
     agg["day"] = _to_days(agg["date"])
     ld = _to_days(dates)
-    pos = pd.Series(np.arange(len(dates))).groupby(
-        np.asarray(codes)).indices
-    names = ["lhb_cnt28", "lhb_net28", "lhb_cnt84", "lhb_net84"]
-    out = np.zeros((len(dates), len(names)), dtype=np.float32)
+    pos = pd.Series(np.arange(len(dates))).groupby(np.asarray(codes)).indices
+    names = ["lhb_cnt28", "lhb_net28", "lhb_turn28", "lhb_ratio28",
+             "lhb_zdf28", "lhb_ddf28", "lhb_lxup28", "lhb_lxdn28",
+             "lhb_hsl28", "lhb_nolim28", "lhb_cnt84", "lhb_net84"]
+    n = len(names)
+    out = np.zeros((len(dates), n), dtype=np.float32)
+    sums = {c: np.cumsum(agg[c].to_numpy(dtype=np.float64)) for c in vcols}
+    sums["__cnt"] = np.cumsum(agg["cnt"].to_numpy(dtype=np.float64))
+
+    def seg(cum, j_hi, j_lo):
+        return cum[j_hi - 1] - np.where(j_lo > 0, cum[j_lo - 1], 0.0)
+
     for code, g in agg.groupby("code", sort=False):
         rows = pos.get(code)
         if rows is None:
             continue
         d = g["day"].to_numpy()
-        cum_c = np.cumsum(g["cnt"].to_numpy(dtype=np.float64))
-        cum_n = np.cumsum(g["net"].to_numpy(dtype=np.float64))
+        gi = g.index.to_numpy()
         t = ld[rows]
         j_hi = np.searchsorted(d, t, side="left")
-        for w, ci in ((28, 0), (84, 2)):
-            j_lo = np.searchsorted(d, t - w, side="left")
-            cnt = cum_c[j_hi - 1] - np.where(j_lo > 0, cum_c[j_lo - 1], 0.0)
-            net = cum_n[j_hi - 1] - np.where(j_lo > 0, cum_n[j_lo - 1], 0.0)
-            out[rows, ci] = np.where(j_hi > 0, cnt, 0.0).astype(np.float32)
-            out[rows, ci + 1] = np.where(j_hi > 0, net, 0.0).astype(np.float32)
+        j_lo = np.searchsorted(d, t - 28, side="left")
+        ok = j_hi > 0
+        cnt = seg(sums["__cnt"], j_hi, j_lo)
+        net = seg(sums["net"], j_hi, j_lo)
+        turn = seg(sums["turn"], j_hi, j_lo)
+        ratio = seg(sums["ratio"], j_hi, j_lo)
+        denom = np.maximum(cnt, 1.0)
+        vals = {
+            "lhb_cnt28": cnt,
+            "lhb_net28": net,
+            "lhb_turn28": turn / denom,
+            "lhb_ratio28": ratio / denom,
+            "lhb_zdf28": seg(sums["f_zdf"], j_hi, j_lo),
+            "lhb_ddf28": seg(sums["f_ddf"], j_hi, j_lo),
+            "lhb_lxup28": seg(sums["f_lxup"], j_hi, j_lo),
+            "lhb_lxdn28": seg(sums["f_lxdn"], j_hi, j_lo),
+            "lhb_hsl28": seg(sums["f_hsl"], j_hi, j_lo),
+            "lhb_nolim28": seg(sums["f_nolim"], j_hi, j_lo),
+        }
+        j_lo84 = np.searchsorted(d, t - 84, side="left")
+        vals["lhb_cnt84"] = seg(sums["__cnt"], j_hi, j_lo84)
+        vals["lhb_net84"] = seg(sums["net"], j_hi, j_lo84)
+        for k, name in enumerate(names):
+            v = np.where(ok, vals[name], 0.0)
+            out[rows, k] = v.astype(np.float32)
     return out, names
 
 

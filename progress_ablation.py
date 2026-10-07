@@ -25,6 +25,9 @@ def main():
         m = re.search(r"\[(\d\d:\d\d:\d\d)\]", starts[-1])
         t0 = datetime.datetime.combine(
             datetime.date.today(), datetime.time.fromisoformat(m.group(1)))
+        now0 = datetime.datetime.now()
+        if t0 > now0:
+            t0 -= datetime.timedelta(days=1)
     now = datetime.datetime.now()
     el = (now - t0).total_seconds() if t0 else 0
     n = len(done)
