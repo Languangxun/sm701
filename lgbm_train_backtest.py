@@ -140,20 +140,31 @@ class ThermalCallback:
 
 # ---------------------------------------------------------------- 数据加载
 def calc_limit(df, con):
-    """逐行涨跌停幅度: 主板10%, 创业板/科创板20%, 北交所30%, ST主板5%"""
+    """逐行涨跌停幅度: 主板10%, 创业板/科创板20%, 北交所30%, ST主板5%
+
+    注意: 创业板20%仅2020-08-24起, 之前为10%(此前全部按20%会误留10%~20%
+    跳空行, 仅影响可交易样本筛选); ST按当前名称回溯(含历史误差);
+    科创板/北交所上市即对应口径(此前无交易数据, 无需分段)"""
     nm = pd.read_sql_query("SELECT code, name FROM stocks", con)
     st_map = dict(zip(nm["code"], nm["name"].fillna("").str.contains("ST", case=False)))
     cats = df["code"].cat.categories
     lim_c = np.full(len(cats), 0.10, dtype=np.float64)
+    cyb = np.zeros(len(cats), dtype=bool)
     for i, cc in enumerate(cats):
         s = str(cc)
-        if s.startswith(("sh688", "sh689", "sz300", "sz301")):
+        if s.startswith(("sh688", "sh689")):
             lim_c[i] = 0.20
         elif s.startswith("bj"):
             lim_c[i] = 0.30
+        elif s.startswith(("sz300", "sz301")):
+            lim_c[i] = 0.20
+            cyb[i] = True  # 需按日期分段, 见下
         elif st_map.get(s, False):
             lim_c[i] = 0.05
-    return lim_c[df["code"].cat.codes.values]
+    out = lim_c[df["code"].cat.codes.values]
+    rows = cyb[df["code"].cat.codes.values]
+    out[rows & (df["date"].values < "2020-08-24")] = 0.10
+    return out
 
 
 def load_bars(limit=None, seed=SEED):

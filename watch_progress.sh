@@ -9,6 +9,8 @@ while true; do
   grep -a "进度" "$HOME/桌面/sm701/extra.log" | tail -1
   echo "== TCN =="
   grep -aE "epoch|超限" "$HOME/桌面/sm701/tcn.log" | tail -6
+  echo "== 多周期训练 =="
+  grep -aE "h=|完成" "$HOME/桌面/sm701/horizon.log" | tail -5
   echo "== GPU =="
   nvidia-smi --query-gpu=utilization.gpu,memory.used,temperature.gpu \
     --format=csv,noheader 2>/dev/null

@@ -28,8 +28,10 @@ LightGBM 特征组消融测试 (Ablation Study)
 
 用法:
     python3 train_ablation.py --limit 300 --rounds 300      # 冒烟
-    python3 train_ablation.py --mode full                    # 全量消融(不采样)
+    python3 train_ablation.py --mode full                    # 全量消融
     python3 train_ablation.py --mode single --groups tech,pattern,fund
+    python3 train_ablation.py --mode horizon --groups tech,pattern,market,industry,fund,flow,margin,lhb,events
+        # T+1/T+5/T+10 三个模型, IC=逐日RankIC对比T日实际收益
     python3 train_ablation.py --train-sample 3000000         # 手动采样加速
 """
 import argparse
@@ -44,9 +46,10 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 
-from lgbm_train_backtest import (DATA_START, SEED, TRAIN_END, _aligned,
-                                 ThermalCallback, asof_align, build_features,
-                                 load_bars, log, run_period)
+from lgbm_train_backtest import (COST, DATA_START, SEED, TRAIN_END,
+                                 _aligned, ThermalCallback, asof_align,
+                                 build_features, daily_ic, load_bars, log,
+                                 perf, run_period)
 from features_extra import (build_event_features, build_flow_features,
                             build_lhb_features, build_margin_features)
 
@@ -201,6 +204,9 @@ def build_industry_features(dates, codes):
     bars = pd.read_sql_query(
         "SELECT industry_code, date, close, amount FROM industry_bars "
         "ORDER BY industry_code, date", con)
+    # 行业映射用当前快照(而非按 start_date 严格asof): start_date 是指数纳入日
+    # 而非行业变更日, 严格对齐会把2018-2021年大部分股票的行业特征清空;
+    # 残余偏差是成分股历史变更, 相对可接受
     mp = pd.read_sql_query("SELECT code, industry_code FROM stock_industry", con)
     con.close()
     gb = bars.groupby("industry_code", sort=False)
@@ -275,8 +281,9 @@ def build_fund_features(dates, codes):
         ind = pd.read_sql_query(
             f"SELECT code, NOTICE_DATE AS date, {cols} FROM fund_indicator_em "
             f"WHERE NOTICE_DATE IS NOT NULL", con)
-        ind["date"] = pd.to_datetime(ind["date"], errors="coerce").dt.strftime(
-            "%Y-%m-%d")
+        # 公告须严格早于t才可用(多为盘后披露, 同日公告在t收盘时未知)
+        ind["date"] = (pd.to_datetime(ind["date"], errors="coerce")
+                       - pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
         ind = ind.dropna(subset=["date"])
         arr = asof_align(codes, dates, ind, "date", FUND_IND_COLS)
         # 报告期指标多为百分比/倍数, 直接使用, 极端值截断(NaN 保留给LGBM)
@@ -292,6 +299,38 @@ def build_fund_features(dates, codes):
     if not mats:
         raise SystemExit("基本面数据表不存在, 请先运行 fetch_fundamentals.py")
     return mats, names
+
+
+# ---------------------------------------------------------------- 多周期标签
+def build_multilabels(df, tradable, horizons=(1, 5, 10)):
+    """多周期标签: R_h = close[t+h]/open[t+1]-1 (t+1开盘买入, 持有h天)
+
+    mask_h: 入场可买(tradable, 与t+1规则一致) 且持有窗内无>5天停牌
+            且i+h仍是同只股票. R为float32(NaN=无效), Y为R>0"""
+    n = len(df)
+    o = df["open"].to_numpy(dtype=np.float64)
+    c = df["close"].to_numpy(dtype=np.float64)
+    cd = df["code"].cat.codes.values
+    date_idx = pd.factorize(df["date"], sort=True)[0]
+    gap = np.full(n, 999, dtype=np.int32)
+    gap[:-1] = date_idx[1:] - date_idx[:-1]
+    gap[:-1][cd[:-1] != cd[1:]] = 999
+    cbad = np.concatenate([[0], np.cumsum((gap > 5).astype(np.int64))])
+    entry = tradable.values
+    out = {}
+    for h in sorted(set(horizons)):
+        if h < 1:
+            raise ValueError(f"horizon须>=1: {h}")
+        R = np.full(n, np.nan, dtype=np.float64)
+        idx = np.arange(n - h)
+        same = cd[idx] == cd[idx + h]
+        sel = idx[same]
+        R[sel] = c[sel + h] / o[sel + 1] - 1.0
+        m = np.zeros(n, dtype=bool)
+        m[sel] = (cbad[sel + h] - cbad[sel] == 0)
+        m &= np.isfinite(R) & entry
+        out[h] = (R.astype(np.float32), (R > 0).astype(np.int8), m)
+    return out
 
 
 # ---------------------------------------------------------------- 消融配置
@@ -343,12 +382,202 @@ def build_config(names, cfg, rows):
     return out
 
 
+def run_hold_backtest(dates_all, codes_all, mask_rows, prob, bars_oc,
+                      bench, h, topks=(10, 20, 50), label=""):
+    """重叠持仓回测: 每个信号日t收盘选TopK, t+1开盘买入持有h天(t+h收盘卖)
+
+    每日组合收益=在持vintage当日收益的等权平均; 成本按进/出分摊
+    (每端COST/2, 与run_period的单程COST口径一致). 仍是T+1调仓, 无日内"""
+    bt = pd.DataFrame({"date": dates_all[mask_rows],
+                       "code": codes_all[mask_rows],
+                       "prob": prob, "row": mask_rows})
+    bt["rk"] = bt.groupby("date")["prob"].rank(ascending=False,
+                                               method="first")
+    o_full, c_full = bars_oc[:, 0], bars_oc[:, 1]
+    rows_out, curves = [], []
+    for K in topks:
+        sel = bt[bt["rk"] <= K]
+        if sel.empty:
+            continue
+        r0 = sel["row"].to_numpy()
+        e, x = r0 + 1, r0 + h
+        rr = np.empty((len(sel), h), dtype=np.float64)
+        rr[:, 0] = c_full[e] / o_full[e] - 1.0
+        for k in range(1, h):
+            rr[:, k] = c_full[e + k] / c_full[e + k - 1] - 1.0
+        dd = np.stack([dates_all[e[i]:e[i] + h] for i in range(len(sel))])
+        long = pd.DataFrame({"date": dd.ravel(), "ret": rr.ravel()})
+        g = long.groupby("date")["ret"].mean()
+        act = long.groupby("date").size()
+        ent = pd.Series(1, index=dates_all[e]).groupby(level=0).sum()
+        ext = pd.Series(1, index=dates_all[x]).groupby(level=0).sum()
+        to = (0.5 * (ent.add(ext, fill_value=0.0) / act)
+              ).reindex(g.index).fillna(0.0)
+        m = perf(g, bench.reindex(g.index).fillna(0.0), to, act)
+        m.update(h=h, K=K, period=label,
+                 strategy=f"Hold{h}Top{K}", days=len(g))
+        rows_out.append(m)
+        curves.append(pd.DataFrame(
+            {"date": g.index, "h": h, "K": K,
+             "ret_net": (g.values - COST * to.values),
+             "equity": (1.0 + g.values - COST * to.values).cumprod()}))
+    return (pd.DataFrame(rows_out),
+            pd.concat(curves, ignore_index=True) if curves
+            else pd.DataFrame())
+
+
+def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
+                     warm, year, dates, codes, nr_all, bars_oc, t0):
+    """多周期模式: 每个horizon独立训练一个二分类模型(特征=全部请求组)
+
+    报告: valid AUC/logloss/acc + 全验证集逐日RankIC(对比T日实际收益)"""
+    allg = tuple(groups)
+    horizons = sorted(labels)
+    log(f"horizon模式: 周期 {horizons}, 特征组 {list(allg)}")
+    cfgs = []
+    if args.per_group:
+        cfgs += [(g,) for g in groups]
+    cfgs.append(allg)
+    seen, dedup = set(), []
+    for c in cfgs:
+        if c not in seen:
+            seen.add(c)
+            dedup.append(c)
+    cfgs = dedup
+    log(f"配置 {len(cfgs)} 个: {[c[0] if len(c) == 1 else 'all' for c in cfgs]}")
+    rs = np.random.RandomState(args.seed)
+    vb = np.flatnonzero(np.isfinite(nr_all) & warm
+                        & ~(year <= int(TRAIN_END[:4])).values)
+    bench = pd.Series(nr_all[vb], index=dates[vb]).groupby(level=0).mean()
+    log(f"市场基准: {len(bench)} 个交易日")
+    rows, hold_all, hold_curves = [], [], []
+    for h in horizons:
+        R, Y, M0 = labels[h]
+        M = M0 & warm
+        yv = Y.astype(np.float32)
+        tr_all = np.flatnonzero(M & (year <= int(TRAIN_END[:4])).values)
+        va_all = np.flatnonzero(M & ~(year <= int(TRAIN_END[:4])).values)
+        tr_h = (np.sort(rs.choice(
+            tr_all, size=min(args.train_sample, len(tr_all)),
+            replace=False)) if args.train_sample else tr_all)
+        va_h = (np.sort(rs.choice(
+            va_all, size=min(args.valid_sample, len(va_all)),
+            replace=False)) if args.valid_sample else va_all)
+        age = (pd.Timestamp(TRAIN_END)
+               - pd.to_datetime(dates[tr_h])).days.values
+        w_h = (0.5 ** (age / 756.0)).astype(np.float32)
+
+        def train_one(cfg, flabel):
+            feat_names = [nm for g in cfg for nm in names[g]]
+            log(f"[h={h}/{flabel}] 特征 {len(feat_names)}, "
+                f"训练 {len(tr_h):,} / 验证 {len(va_h):,}")
+            Xtr = build_config(names, cfg, tr_h)
+            dtr = lgb.Dataset(Xtr, label=yv[tr_h], weight=w_h,
+                              feature_name=feat_names)
+            del Xtr
+            gc.collect()
+            Xva = build_config(names, cfg, va_h)
+            dva = lgb.Dataset(Xva, label=yv[va_h], reference=dtr)
+            del Xva
+            gc.collect()
+            model = lgb.train(
+                params, dtr, num_boost_round=args.rounds, valid_sets=[dva],
+                callbacks=[lgb.early_stopping(150, first_metric_only=True,
+                                              verbose=False),
+                           thermal_cb,
+                           lgb.log_evaluation(200)])
+            Xva = build_config(names, cfg, va_h)
+            p_va = model.predict(Xva, num_iteration=model.best_iteration)
+            del Xva
+            gc.collect()
+            bt = pd.DataFrame({"date": dates[va_h], "prob": p_va,
+                               "next_ret": R[va_h]})
+            ic = daily_ic(bt)
+            ic_mean = float(ic.mean()) if len(ic) else 0.0
+            ic_ir = float(ic_mean / (ic.std() + 1e-12)) if len(ic) else 0.0
+            row = {"horizon": h, "config": flabel, "n_feat": len(feat_names),
+                   "n_train": len(tr_h), "n_valid": len(va_h),
+                   "best_iter": model.best_iteration,
+                   "valid_auc": roc_auc_score(yv[va_h], p_va),
+                   "valid_logloss": log_loss(yv[va_h], p_va),
+                   "valid_acc": accuracy_score(yv[va_h], p_va > 0.5),
+                   "base_rate": float(yv[va_h].mean()),
+                   "ic": ic_mean, "ic_ir": ic_ir}
+            if h == 1 and not args.no_backtest:
+                bt2 = pd.DataFrame({
+                    "date": dates[va_h], "code": codes[va_h], "prob": p_va,
+                    "next_ret": R[va_h], "y": yv[va_h]})
+                s, _, _, _, _, _ = run_period(bt2, f"h={h}/{flabel}")
+                for strat in ("Top20", "Top50", "P>=0.55"):
+                    m = s[s["strategy"] == strat]
+                    if not m.empty:
+                        key = strat.replace(">=", "").replace(".", "")
+                        row[f"{key}_ann_net"] = float(m.iloc[0]["ann_net"])
+                        row[f"{key}_sharpe"] = float(m.iloc[0]["sharpe"])
+                row["mkt_ann_net"] = float(
+                    s[s["strategy"] == "市场等权"].iloc[0]["ann_net"])
+                del bt2, s
+            if not args.no_backtest:
+                hs, hc = run_hold_backtest(
+                    dates, codes, va_h, p_va, bars_oc, bench, h,
+                    topks=(10, 20, 50), label=f"h={h}/{flabel}")
+                for _, m in hs.iterrows():
+                    row[f"hold{m['K']}_ann"] = float(m["ann_net"])
+                    row[f"hold{m['K']}_sharpe"] = float(m["sharpe"])
+                    row[f"hold{m['K']}_mdd"] = float(m["mdd"])
+                hold_all.append(hs)
+                hold_curves.append(hc)
+            rows.append(row)
+            log(f"[h={h}/{flabel}] 完成: valid_auc {row['valid_auc']:.4f}, "
+                f"IC {row['ic']:.4f}, best_iter {row['best_iter']}, "
+                f"用时 {(time.time() - t0) / 60:.1f} min")
+            model.save_model(
+                os.path.join(OUT_DIR, f"lgbm_h{h}_{flabel}.txt"))
+            del dtr, dva, model, bt
+            gc.collect()
+
+        for cfg in cfgs:
+            flabel = cfg[0] if len(cfg) == 1 else "all"
+            train_one(cfg, flabel)
+
+    res = pd.DataFrame(rows)
+    res.to_csv(os.path.join(OUT_DIR, "horizon_results.csv"), index=False)
+    if hold_all:
+        pd.concat(hold_all, ignore_index=True).to_csv(
+            os.path.join(OUT_DIR, "holdbacktest_summary.csv"), index=False)
+    if hold_curves:
+        pd.concat([c for c in hold_curves if len(c)], ignore_index=True).to_csv(
+            os.path.join(OUT_DIR, "holdbacktest_daily.csv"), index=False)
+    print("\n================ 多周期结果 "
+          "(IC=全验证集逐日RankIC, 对比T日实际收益) ================")
+    print(res.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    with open(os.path.join(OUT_DIR, "horizon_run_config.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"mode": "horizon", "groups": groups,
+                   "horizons": horizons, "params": params,
+                   "limit": args.limit}, f, ensure_ascii=False, indent=2)
+    if not args.keep_features:
+        for g in names:
+            for suffix in (".npy", ".cols.json"):
+                try:
+                    os.remove(os.path.join(OUT_DIR, f"feat_{g}{suffix}"))
+                except OSError:
+                    pass
+    print(f"\n输出目录: {OUT_DIR}")
+    log(f"全部完成, 总用时 {(time.time() - t0) / 60:.1f} min")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="随机抽取N只股票(冒烟)")
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--mode", default="full",
-                    choices=["full", "single", "cum", "loo"])
+                    choices=["full", "single", "cum", "loo", "horizon"])
+    ap.add_argument("--horizons", default="1,5,10",
+                    help="horizon模式的预测周期(天), 逗号分隔. "
+                    "R_h=close[t+h]/open[t+1]-1")
+    ap.add_argument("--per-group", action="store_true",
+                    help="horizon模式下每个特征组单独训练(找每周期最强组)")
     ap.add_argument("--groups", default=DEFAULT_GROUPS,
                     help="逗号分隔, 可选: " + ",".join(GROUPS))
     ap.add_argument("--rounds", type=int, default=2000)
@@ -411,6 +640,7 @@ def main():
     tech_cols = [c for c in X.columns if c not in MKT_COLS]
     put("tech", to_matrix(X, tech_cols), tech_cols)
     mkt_base = to_matrix(X, MKT_COLS)
+    warm = ((year >= int(DATA_START[:4])) & X["ret60"].notna()).values
     del X
     gc.collect()
 
@@ -422,6 +652,16 @@ def main():
 
     y_all = y.to_numpy(dtype=np.float32)
     nr_all = next_ret.to_numpy(dtype=np.float32)
+    bars_oc = np.stack([df["open"].to_numpy(dtype=np.float64),
+                        df["close"].to_numpy(dtype=np.float64)], axis=1)
+    labels = None
+    if args.mode == "horizon":
+        horizons = [int(v) for v in args.horizons.split(",") if v.strip()]
+        labels = build_multilabels(df, tradable, tuple(horizons))
+        log(f"多周期标签: {sorted(labels)}")
+        for h, (R, Y, M) in labels.items():
+            log(f"  h={h}: 训练 {(M & (year <= int(TRAIN_END[:4])).values).sum():,} / "
+                f"验证 {(M & ~(year <= int(TRAIN_END[:4])).values).sum():,}")
     del df, next_ret, base
     gc.collect()
 
@@ -478,6 +718,11 @@ def main():
     thermal_cb = ThermalCallback(limit=args.temp_limit,
                                  resume=args.temp_resume,
                                  throttle=args.throttle, every=5)
+
+    if args.mode == "horizon":
+        run_horizon_mode(args, params, thermal_cb, groups, names, labels,
+                         warm, year, dates, codes, nr_all, bars_oc, t0)
+        return
 
     configs = make_configs(args.mode, groups)
     log(f"消融配置 {len(configs)} 个: {['+'.join(c) for c in configs]}")
