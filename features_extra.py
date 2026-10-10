@@ -34,6 +34,19 @@ def build_flow_features(dates, codes):
                "FROM stock_fund_flow")
     if df.empty:
         return None, []
+    # 覆盖率上报: flow 接口仅返回最近约120个交易日, 覆盖不全时提示重跑
+    # (网络好时用 NO_PROXY=.eastmoney.com 重跑 fetch_extra_data.py --datasets flow)
+    n_codes = int(df["code"].nunique())
+    n_universe = int(pd.Series(np.asarray(codes)).nunique())
+    try:
+        dmin, dmax = str(df["date"].min()), str(df["date"].max())
+    except Exception:
+        dmin, dmax = "?", "?"
+    log(f"资金流覆盖: {n_codes:,} 只 / 宇宙 {n_universe:,} 只 "
+        f"({n_codes / max(n_universe, 1):.1%}), 日期 {dmin}~{dmax}")
+    if n_codes / max(n_universe, 1) < 0.5:
+        log("警告: 资金流覆盖不足50%, 该组基本无信息量; "
+            "网络好时重跑 fetch_extra_data.py --datasets flow 补齐")
     for c in ("main_pct", "xl_pct", "l_pct", "s_pct"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.sort_values(["code", "date"]).reset_index(drop=True)

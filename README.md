@@ -176,11 +176,12 @@ mkt1/mkt5/mkt20/breadth5（全市场等权收益+上涨家数占比）＋ 4 个�
 ### 5.5 fund（29 列）：基本面
 - 估值 7 列（`fund_valuation` 按日精确对齐、缺失向前填）：ep=1/pe_ttm（clip±1）、bp=1/pb（0–5）、sp=1/ps、cfp=1/pcf、peg、log_mv、float_ratio。
 - 财报 22 列（`fund_indicator_em` **按 NOTICE_DATE−1 天 asof**，只用公告日严格早于 t 的报告）：roe、roe_kcfj、毛利率/净利率/ROA、营收/净利/扣非同比、eps、bps、ocf_ps、资产负债率、流动/速动比率、现金流占比、经营现金流/营收、应收/营收、周转天数（总资产/存货/应收）、roic、total_roi。极端值截断 ±1000，缺失保留 NaN 给 LightGBM。
+- 横截面处理（`train_ablation.py --fund-norm`，只用 t 日当天横截面，PIT 安全）：`cross`（默认，当日 z-score）/`industry`（先减行业内均值再除当日标准差，clip ±5，无映射行退回全市场均值）；`none` 为原始值。日内有效样本 <10 或标准差 ~0 的列跳过。
 - 百度长历史估值、新浪 86 指标、财务摘要：**训练未用**（周频/无公告日）。
 
 ### 5.6 flow（7 列）：资金流
-main/xl/l/d/s 净流入占比 + main_5/20、xl_5 均值；**组内错后 1 个交易日**（盘后披露）。
-⚠️ 仅覆盖 2026-04 后约 120 个交易日、197 只股票——当前基本无信息量。
+ main/xl/l/d/s 净流入占比 + main_5/20、xl_5 均值；**组内错后 1 个交易日**（盘后披露）。
+⚠️ 仅覆盖 2026-04 后约 120 个交易日、197 只股票——当前基本无信息量（构建时打印覆盖率，不足 50% 告警；有效值 <1% 时训练自动跳过该组）。
 
 ### 5.7 margin（6 列）：两融
 融资余额 1/5/20 日变化、融资买入偿还比、融券余额 5 日变化、log(融资余额)；**T+1 披露，错后 1 个交易日**；2010-03 起全量（SSE 4010 天 / SZSE 3772 天）。
@@ -234,7 +235,7 @@ main/xl/l/d/s 净流入占比 + main_5/20、xl_5 均值；**组内错后 1 个�
 |---|---|---|
 | `lgbm_train_backtest.py` | LGBM 基线（44 技术特征）+ 训练/验证分段回测 | `--limit/--rounds/--leaves/--lr` |
 | `lgbm_tcn_ensemble.py` | LGBM 复用 + TCN 训练 + 三路回测对比 | `--lookback/--channels/--dilations/--tcn-weight/--device/--resume` |
-| `train_ablation.py` | **主脚本**：9 特征组消融 + 多周期 | `--mode full/single/cum/loo/horizon`，`--groups`，`--horizons 1,5,10`，`--per-group`，`--train-sample/--valid-sample`（0=全量），`--threads/--throttle/--temp-limit/--temp-resume` |
+| `train_ablation.py` | **主脚本**：9 特征组消融 + 多周期 + walk-forward | `--mode full/single/cum/loo/horizon/walkforward`，`--groups`（默认 `tech,pattern,industry,fund`，market 默认不进选股），`--horizons 1,5,10`，`--per-group`，`--fund-norm cross/industry/none`，`--calibrate platt --calib-year 2023`，`--regime breadth/trend --max-dd`，`--hold-thrs`，`--wf-valid-years`，`--train-sample/--valid-sample`（0=全量），`--threads/--throttle/--temp-limit/--temp-resume` |
 | `train_tcn_pattern.py` | TCN（序列）vs LGBM（标量）对照：pattern/tech/tech+pattern 同采样对比 | `--configs/--lookback/--epochs/--batch-size/--skip-lgbm/--no-parallel` |
 | `analyze_lhb.py` | 龙虎榜深挖：分年度/分月/股票池对照/IC | 直接运行 |
 | `features_extra.py` | flow/margin/lhb/events 四组构建器（被消融脚本调用） | — |
@@ -251,6 +252,8 @@ main/xl/l/d/s 净流入占比 + main_5/20、xl_5 均值；**组内错后 1 个�
 
 - `run_period`（h=1）：等权 TopK（5/10/20/50）+ 概率阈值（0.50/0.55/0.60，入选不足 5 只则空仓）+ 市场等权基准；输出年化（毛/净/超额）、Sharpe、MDD、日胜率、换手率、概率分档、年度 AUC、RankIC。
 - `run_hold_backtest`（h=5/10）：**重叠持仓**——每日信号选 TopK（10/20/50），持有 h 天；每日组合收益 = 在持 vintage 当日收益等权平均；成本按进/出分摊（与单程口径一致）。仍是每日开盘调仓，无日内。
+- 阈值类持有（`--hold-thrs 0.50,0.55,0.60`）：信号日选 prob≥thr（入选不足 5 只当天空仓），持有 h 天重叠平均，策略记 `Hold{h}P{thr}`，成本口径与 TopK 一致。
+- 状态与风控（重叠持仓）：`--regime breadth/trend`（breadth5 位置，risk-off 当天不开新仓、在持继续）；`--max-dd`（因果回撤控制，组合相对峰值回撤跌破阈值后空仓，逐日顺序模拟、无前视）。
 - tradable 过滤用 t+1 开盘价判断涨停买不到——开盘集合竞价可见，**可执行，不算前视**；回测曲线按信号日 t 记账只是展示惯例。
 
 ---
@@ -375,7 +378,9 @@ Platt/Isotonic 实验（2024 拟合 → 2025–2026 评估，223 万样本，`re
 
 - Python 3.14，lightgbm 4.7.0，torch 2.14.1+cu126，akshare 1.19.1，pandas 3.0.6，numpy 2.5.3，scikit-learn 1.9.1，tabulate 0.10.0。机器：14G 内存 / 8 核 / MX350 2G。
 - 全量消融：`python3 train_ablation.py --mode full`（13 配置，~1.5h；9 组 25 配置约 2–3h）
-- 多周期：`python3 train_ablation.py --mode horizon --groups tech,pattern,industry,fund,flow,margin,lhb,events`（T+1/5/10，~1h）；加 `--per-group` 找每周期最强组（30 模型，~3–4h）
+- 多周期：`python3 train_ablation.py --mode horizon --groups tech,pattern,industry,fund,flow,margin,lhb,events`（T+1/5/10，~1h；market 只在显式指定时加入，默认不进选股）；加 `--per-group` 找每周期最强组（30 模型，~3–4h）
+- walk-forward：`python3 train_ablation.py --mode walkforward --wf-valid-years 2022,2023`（多窗口验证 + 2024+ holdout 定稿评估）
+- 校准+风控：`--calibrate platt --calib-year 2023`（2018–2022 训练/2023 校准/2024+ 评估，回测用校准概率）+ `--regime breadth --max-dd 0.15`
 - TCN 对比：`python3 train_tcn_pattern.py --configs pattern,tech,tech+pattern --epochs 5`（GPU）
 - 龙虎榜深挖：`python3 analyze_lhb.py` → `ablation_output/lhb_deepdive.md`
 - 校准：`python3 eval_calibration.py` / `python3 eval_calibrate.py` → `reports/`
@@ -389,7 +394,7 @@ Platt/Isotonic 实验（2024 拟合 → 2025–2026 评估，223 万样本，`re
 |---|---|
 | `lgbm_output/` | LGBM 基线：模型/重要度/回测汇总/逐日净值/分档/年AUC/**逐样本验证预测**（校准用） |
 | `ensemble_output/` | LGBM+TCN：三路评估与回测、融合权重扫描、逐样本预测 |
-| `ablation_output/` | 消融：`ablation_results.csv`（排序对比）、`ablation_importance.csv`、`horizon_results.csv`（+`config`列）、`holdbacktest_summary/daily.csv`、`lgbm_all.txt`、`lgbm_h{h}[_all].txt`、`lhb_deepdive.md`、`lhb_monthly.csv`、`run_config.json` |
+| `ablation_output/` | 消融：`ablation_results.csv`（排序对比）、`ablation_importance.csv`、`horizon_results.csv`（+`config`列/分年度 `auc_年`/`ic_年`列/`holdP*`阈值持有列）、`holdbacktest_summary/daily.csv`（TopK + `Hold{h}P{thr}` 阈值策略）、`walkforward_results.csv` + `holdbacktest_wf_*`（walk-forward 窗口与 holdout）、`lgbm_all.txt`、`lgbm_h{h}[_all].txt`、`lhb_deepdive.md`、`lhb_monthly.csv`、`run_config.json` |
 | `tcn_output/` | `tcn_results.csv`、`backtest_report.md`、`backtest_summary.csv` |
 | `reports/` | 清洗报告 / 校准评估 / 校准对比（日期命名） |
 
@@ -397,9 +402,8 @@ Platt/Isotonic 实验（2024 拟合 → 2025–2026 评估，223 万样本，`re
 
 ## 17. 已知限制与下一步
 
-1. `flow`（资金流）只覆盖 197 只：push2his 经代理不稳定（`ProxyError`），直连偶发 `RemoteDisconnected`；网络好时用 `NO_PROXY=.eastmoney.com` 重跑 `fetch_extra_data.py --datasets flow`。
-2. T+1 最强仍是 tech 40 特征（0.5440）；T+5/T+10 真实技能在 tech（IC 0.046/0.067，fund 的 IC 接近可供参考），industry 的 IC 为负、market 组禁入选股模型。
-3. 基本面缺横截面标准化/行业中性化；`fund` best_iter=1 的单树高 IC 需分年度验证。
-4. 最终定稿建议：walk-forward 多窗口 + holdout；Platt 接入训练流程（2018–2022 训练 / 2023 校准 / 2024+ 评估）并重搜阈值；lhb/fund 高 beta 组合配 regime 过滤与回撤控制。
-5. T+5/T+10 重叠持仓回测已实现（`holdbacktest_*.csv`，Top10/20/50），但阈值类持有策略未做。
-6. 硬件：散热是瓶颈（待机 76–80°C 偏高），长跑任务建议开限温 `--temp-limit 92 --temp-resume 85` + 换硅脂/清灰。
+1. `flow`（资金流）覆盖仍待补数据：构建侧现打印覆盖率（只数/宇宙/日期段），不足 50% 告警；有效值 <1% 的组训练时自动跳过；`fetch_extra_data.py` 对 flow 提至 ≥5 次重试 + 退避上限 120s + 缺 `NO_PROXY` 时提示绕行。网络好时用 `NO_PROXY=.eastmoney.com` 重跑 `fetch_extra_data.py --datasets flow`。
+2. 选股默认组已剔除 `market`（`--groups` 默认 `tech,pattern,industry,fund`）；手动指定 `market` 会打印禁入选股警告（每日常数→早期分裂趋同→TopK 退化，仅择时研究保留）。
+3. 基本面：`--fund-norm cross`（默认，当日 z-score，PIT 安全）/`industry`（行业中性化后 z-score，clip ±5）；horizon/walkforward 打印分年度 AUC/acc/IC 表；`best_iter≤5` 自动提示单树早停、以分年度稳定性为准。
+4. 定稿流程：`--mode walkforward`（`--wf-valid-years 2022,2023` 窗口 + 2024+ holdout）；Platt：`--calibrate platt`（2018–2022 训练/2023 校准/2024+ 评估，回测与阈值重搜用校准概率，报告 LogLoss/ECE 前后对比）；lhb/fund 高 beta 组合：`--regime breadth|trend`（risk-off 不开新仓）+ `--max-dd`（因果回撤控制）。
+5. T+5/T+10 阈值类重叠持仓回测已实现（`--hold-thrs 0.50,0.55,0.60`，`Hold{h}P{thr}` 策略，入选不足 5 只当天空仓，成本/regime/回撤口径与 TopK 一致）。

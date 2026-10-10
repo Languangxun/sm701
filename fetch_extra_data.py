@@ -336,8 +336,12 @@ class Writer:
 
 
 def worker(dataset, key, retry, sleep):
+    # flow 接口(push2his)经代理易 ProxyError、直连偶发 RemoteDisconnected,
+    # 给 flow 更多重试次数与更长的退避上限
+    attempts = max(max(1, retry), 5) if dataset == "flow" else max(1, retry)
+    cap = 120.0 if dataset == "flow" else 60.0
     df, err = None, None
-    for attempt in range(max(1, retry)):
+    for attempt in range(attempts):
         try:
             df = do_fetch(dataset, key)
             if df is None:
@@ -347,7 +351,7 @@ def worker(dataset, key, retry, sleep):
             err = "empty"
         except Exception as e:
             df, err = None, f"{type(e).__name__}: {e}"
-        time.sleep(min(60.0, 2.0 ** attempt + random.random()))
+        time.sleep(min(cap, 2.0 ** attempt + random.random()))
     if sleep > 0:
         time.sleep(sleep)
     if err == "empty":
@@ -372,6 +376,10 @@ def main():
     for d in datasets:
         if d not in TABLE_OF:
             raise SystemExit(f"未知数据集 {d}, 可选: {', '.join(TABLE_OF)}")
+    if "flow" in datasets and not os.environ.get("NO_PROXY"):
+        log("提示: flow 接口(push2his)在代理下易失败, 建议 "
+            "NO_PROXY=.eastmoney.com python3 fetch_extra_data.py "
+            "--datasets flow 绕行重跑")
 
     writer = Writer(args.db)
     con = writer.con

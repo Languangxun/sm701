@@ -32,6 +32,10 @@ LightGBM 特征组消融测试 (Ablation Study)
     python3 train_ablation.py --mode single --groups tech,pattern,fund
     python3 train_ablation.py --mode horizon --groups tech,pattern,market,industry,fund,flow,margin,lhb,events
         # T+1/T+5/T+10 三个模型, IC=逐日RankIC对比T日实际收益
+    python3 train_ablation.py --mode walkforward --groups tech,pattern,industry,fund
+        # walk-forward多窗口(2022/2023验证)+2024+holdout定稿评估
+    python3 train_ablation.py --mode horizon --calibrate platt --regime breadth --max-dd 0.15
+        # Platt校准(2018-2022训练/2023校准/2024+评估)+状态过滤+回撤控制
     python3 train_ablation.py --train-sample 3000000         # 手动采样加速
 """
 import argparse
@@ -40,13 +44,14 @@ import json
 import os
 import sqlite3
 import time
+import warnings
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 
-from lgbm_train_backtest import (COST, DATA_START, SEED, TRAIN_END,
+from lgbm_train_backtest import (COST, DATA_START, MIN_HOLD, SEED, TRAIN_END,
                                  _aligned, ThermalCallback, asof_align,
                                  build_features, daily_ic, load_bars, log,
                                  perf, run_period)
@@ -59,7 +64,9 @@ OUT_DIR = os.path.join(HERE, "ablation_output")
 
 GROUPS = ["tech", "pattern", "market", "industry", "fund",
           "flow", "margin", "lhb", "events"]
-DEFAULT_GROUPS = "tech,pattern,market,industry,fund"
+# market 组是每日常数特征(同一天所有股票值相同), 混入横截面选股模型会占据
+# 早期分裂、日内预测趋同、TopK退化——默认不进选股, 仅择时研究时手动指定
+DEFAULT_GROUPS = "tech,pattern,industry,fund"
 MKT_COLS = ["mkt1", "mkt5", "mkt20", "breadth5"]
 
 MARKET_INDICES = ["sh000001", "sz399001", "sz399006", "sh000300"]
@@ -301,6 +308,99 @@ def build_fund_features(dates, codes):
     return mats, names
 
 
+# ------------------------------------------------- 基本面横截面标准化/行业中性化
+def load_industry_map():
+    """个股->申万一级行业映射(当前快照, 与行业特征同一口径, 残余偏差见README §5.4)"""
+    con = sqlite3.connect(DB)
+    try:
+        mp = pd.read_sql_query("SELECT code, industry_code FROM stock_industry",
+                               con)
+    finally:
+        con.close()
+    return dict(zip(mp["code"], mp["industry_code"]))
+
+
+def neutralize_fund_features(mat, dates, codes, mode="cross", ind_map=None):
+    """基本面横截面标准化/行业中性化 (PIT安全: 只用 t 日当天的横截面)
+
+    - cross:    z = (x - 当日均值) / 当日标准差
+    - industry: 先减行业内均值(无映射的行用全市场均值), 再除以当日标准差
+    NaN 保留(不填充, 交给 LightGBM); 结果 clip ±5;
+    日内有效样本 <10 或标准差 ~0 的列跳过(保留原值)"""
+    if mode == "none":
+        return mat
+    out = np.array(mat, dtype=np.float32, copy=True)
+    dates_a = np.asarray(dates)
+    order = np.argsort(dates_a, kind="stable")
+    sd = dates_a[order]
+    uniq, cnts = np.unique(sd, return_counts=True)
+    ind_arr = None
+    if mode == "industry":
+        ind_arr = np.array(
+            [ind_map.get(str(c), "") if ind_map else "" for c in
+             np.asarray(codes)], dtype=object)
+    pos = 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for _, c in zip(uniq, cnts):
+            rows = order[pos:pos + c]
+            pos += c
+            b = out[rows].astype(np.float64)
+            n = (~np.isnan(b)).sum(axis=0)
+            mu = np.nanmean(b, axis=0)
+            sd_ = np.nanstd(b, axis=0)
+            if mode == "industry" and ind_arr is not None:
+                gi = ind_arr[rows]
+                for ind in np.unique(gi):
+                    m = gi == ind
+                    if m.sum() < 2:
+                        continue
+                    sub = b[m]
+                    gm = np.nanmean(sub, axis=0)
+                    use = ~np.isnan(gm)
+                    sub[:, use] -= gm[use]
+                    b[m] = sub
+            else:
+                good = (n >= 10) & np.isfinite(mu)
+                b[:, good] -= mu[good]
+            good = ((n >= 10) & np.isfinite(sd_) & (sd_ > 1e-12))
+            if good.any():
+                b[:, good] /= sd_[good]
+                np.clip(b[:, good], -5.0, 5.0, out=b[:, good])
+            out[rows] = b.astype(np.float32)
+    return out
+
+
+def yearly_metrics(dates, y, p, ret):
+    """分年度验证: 每年 n/AUC/acc + 年内逐日 RankIC(对比T日实际收益)"""
+    df = pd.DataFrame({"date": np.asarray(dates),
+                       "y": np.asarray(y, dtype=np.float32),
+                       "p": np.asarray(p, dtype=np.float64),
+                       "r": np.asarray(ret, dtype=np.float32)})
+    df["year"] = df["date"].str.slice(0, 4)
+    rows = []
+    for yy, g in df.groupby("year"):
+        n = len(g)
+        auc = (roc_auc_score(g["y"], g["p"])
+               if g["y"].nunique() > 1 else float("nan"))
+        acc = float(((g["p"] > 0.5).astype(np.int8) == g["y"]).mean())
+        sub = pd.DataFrame({"date": g["date"], "prob": g["p"],
+                            "next_ret": g["r"]})
+        ic = daily_ic(sub)
+        rows.append({"year": yy, "n": n, "auc": float(auc), "acc": acc,
+                     "ic": float(ic.mean()) if len(ic) else 0.0,
+                     "ic_n": int(len(ic))})
+    del df
+    gc.collect()
+    return pd.DataFrame(rows)
+
+
+def log_yearly_table(tab, label):
+    for _, r in tab.iterrows():
+        log(f"[{label}/{r['year']}] n={r['n']:,} auc={r['auc']:.4f} "
+            f"acc={r['acc']:.4f} ic={r['ic']:.4f} (ic_n={r['ic_n']})")
+
+
 # ---------------------------------------------------------------- 多周期标签
 def build_multilabels(df, tradable, horizons=(1, 5, 10)):
     """多周期标签: R_h = close[t+h]/open[t+1]-1 (t+1开盘买入, 持有h天)
@@ -382,55 +482,176 @@ def build_config(names, cfg, rows):
     return out
 
 
+def ece_of(y, p, n_bins=10):
+    y = np.asarray(y, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    idx = np.clip(np.digitize(p, edges[1:-1]), 0, n_bins - 1)
+    e, n = 0.0, len(y)
+    for b in range(n_bins):
+        m = idx == b
+        if m.sum():
+            e += m.sum() / n * abs(float(p[m].mean()) - float(y[m].mean()))
+    return float(e)
+
+
+def fit_platt(p_cal, y_cal):
+    """Platt 校准: 在校准集 (默认2023年, 未参与训练) 上拟合 Logistic 映射"""
+    from sklearn.linear_model import LogisticRegression
+    lr = LogisticRegression().fit(
+        np.asarray(p_cal, dtype=np.float64).reshape(-1, 1),
+        np.asarray(y_cal, dtype=np.float64))
+    return lr
+
+
+def apply_platt(lr, p):
+    return lr.predict_proba(
+        np.asarray(p, dtype=np.float64).reshape(-1, 1))[:, 1]
+
+
+def thr_table(y, p, thrs=(0.50, 0.55, 0.60, 0.65)):
+    y = np.asarray(y, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    return {t: (float(y[p >= t].mean()) if (p >= t).any() else 0.0,
+                int((p >= t).sum())) for t in thrs}
+
+
+def build_regime_series(dates, mkt_base, kind="breadth"):
+    """市场状态序列 (PIT安全: 只用 t 日收盘可得的 breadth5)
+
+    - breadth: breadth5 > 0.5 为 risk-on
+    - trend:   breadth5 > 自身20日均线为 risk-on (预热期默认 True)
+    返回 pd.Series(date -> bool); risk-off 当天不开新仓, 在持 vintage 继续持有"""
+    b = (pd.Series(mkt_base[:, MKT_COLS.index("breadth5")],
+                   index=np.asarray(dates)).groupby(level=0).first())
+    if kind == "trend":
+        ma = b.rolling(20, min_periods=20).mean()
+        return (b > ma).fillna(True)
+    return b > 0.5
+
+
+def _hold_perf_from_selection(sel_rows, dates_all, bars_oc, bench, h,
+                              strategy, label, max_dd=0.0):
+    """由信号行 vintage 构造重叠持仓曲线 (单策略).
+
+    max_dd > 0 时做因果回撤控制: 组合相对峰值回撤跌破 -max_dd 后空仓,
+    直到回到阈值内 (逐日顺序模拟, 无前视)"""
+    o_full, c_full = bars_oc[:, 0], bars_oc[:, 1]
+    r0 = np.asarray(sel_rows)
+    if len(r0) == 0:
+        return None, None
+    e, x = r0 + 1, r0 + h
+    rr = np.empty((len(r0), h), dtype=np.float64)
+    rr[:, 0] = c_full[e] / o_full[e] - 1.0
+    for k in range(1, h):
+        rr[:, k] = c_full[e + k] / c_full[e + k - 1] - 1.0
+    dd = np.stack([dates_all[e[i]:e[i] + h] for i in range(len(r0))])
+    long = pd.DataFrame({"date": dd.ravel(), "ret": rr.ravel()})
+    g = long.groupby("date")["ret"].mean()
+    act = long.groupby("date").size()
+    ent = pd.Series(1, index=dates_all[e]).groupby(level=0).sum()
+    ext = pd.Series(1, index=dates_all[x]).groupby(level=0).sum()
+    to = (0.5 * (ent.add(ext, fill_value=0.0) / act)
+          ).reindex(g.index).fillna(0.0)
+    to_v, g_v = to.values, g.values
+    if max_dd and max_dd > 0:
+        # 因果模拟: 超回撤则空仓 (收益与换手同时置零)
+        eq, peak = 1.0, 1.0
+        active = np.zeros(len(g_v), dtype=bool)
+        for i, r in enumerate(g_v - COST * to_v):
+            if eq / peak - 1.0 <= -max_dd:
+                continue
+            active[i] = True
+            eq *= (1.0 + r)
+            peak = max(peak, eq)
+        g_s = pd.Series(g_v * active, index=g.index)
+        to = pd.Series(to_v * active, index=g.index)
+    else:
+        g_s = g
+    m = perf(g_s, bench.reindex(g.index).fillna(0.0), to, act)
+    m.update(h=h, period=label, strategy=strategy, days=len(g))
+    curve = pd.DataFrame(
+        {"date": g.index, "h": h, "strategy": strategy,
+         "ret_net": (g_s.values - COST * to.values),
+         "equity": (1.0 + g_s.values - COST * to.values).cumprod()})
+    return m, curve
+
+
 def run_hold_backtest(dates_all, codes_all, mask_rows, prob, bars_oc,
-                      bench, h, topks=(10, 20, 50), label=""):
+                      bench, h, topks=(10, 20, 50), label="",
+                      regime=None, max_dd=0.0):
     """重叠持仓回测: 每个信号日t收盘选TopK, t+1开盘买入持有h天(t+h收盘卖)
 
     每日组合收益=在持vintage当日收益的等权平均; 成本按进/出分摊
-    (每端COST/2, 与run_period的单程COST口径一致). 仍是T+1调仓, 无日内"""
+    (每端COST/2, 与run_period的单程COST口径一致). 仍是T+1调仓, 无日内.
+    regime 非空时 risk-off 当天不开新仓; max_dd>0 时做因果回撤控制"""
     bt = pd.DataFrame({"date": dates_all[mask_rows],
                        "code": codes_all[mask_rows],
                        "prob": prob, "row": mask_rows})
     bt["rk"] = bt.groupby("date")["prob"].rank(ascending=False,
                                                method="first")
-    o_full, c_full = bars_oc[:, 0], bars_oc[:, 1]
+    if regime is not None:
+        on = set(regime[regime].index)
+        bt = bt[bt["date"].isin(on)]
     rows_out, curves = [], []
     for K in topks:
         sel = bt[bt["rk"] <= K]
         if sel.empty:
             continue
-        r0 = sel["row"].to_numpy()
-        e, x = r0 + 1, r0 + h
-        rr = np.empty((len(sel), h), dtype=np.float64)
-        rr[:, 0] = c_full[e] / o_full[e] - 1.0
-        for k in range(1, h):
-            rr[:, k] = c_full[e + k] / c_full[e + k - 1] - 1.0
-        dd = np.stack([dates_all[e[i]:e[i] + h] for i in range(len(sel))])
-        long = pd.DataFrame({"date": dd.ravel(), "ret": rr.ravel()})
-        g = long.groupby("date")["ret"].mean()
-        act = long.groupby("date").size()
-        ent = pd.Series(1, index=dates_all[e]).groupby(level=0).sum()
-        ext = pd.Series(1, index=dates_all[x]).groupby(level=0).sum()
-        to = (0.5 * (ent.add(ext, fill_value=0.0) / act)
-              ).reindex(g.index).fillna(0.0)
-        m = perf(g, bench.reindex(g.index).fillna(0.0), to, act)
-        m.update(h=h, K=K, period=label,
-                 strategy=f"Hold{h}Top{K}", days=len(g))
+        m, curve = _hold_perf_from_selection(
+            sel["row"].to_numpy(), dates_all, bars_oc, bench, h,
+            f"Hold{h}Top{K}", label, max_dd)
+        if m is None:
+            continue
+        m["K"] = K
         rows_out.append(m)
-        curves.append(pd.DataFrame(
-            {"date": g.index, "h": h, "K": K,
-             "ret_net": (g.values - COST * to.values),
-             "equity": (1.0 + g.values - COST * to.values).cumprod()}))
+        curves.append(curve)
+    return (pd.DataFrame(rows_out),
+            pd.concat(curves, ignore_index=True) if curves
+            else pd.DataFrame())
+
+
+def run_hold_threshold_backtest(dates_all, codes_all, mask_rows, prob,
+                                bars_oc, bench, h,
+                                thrs=(0.50, 0.55, 0.60), label="",
+                                regime=None, max_dd=0.0):
+    """阈值类重叠持仓回测: 信号日选 prob>=thr (入选不足 MIN_HOLD 只则当天空仓),
+    t+1开盘买入持有h天; 每日组合=在持vintage等权平均; 成本与 TopK 口径一致"""
+    bt = pd.DataFrame({"date": dates_all[mask_rows],
+                       "code": codes_all[mask_rows],
+                       "prob": prob, "row": mask_rows})
+    if regime is not None:
+        on = set(regime[regime].index)
+        bt = bt[bt["date"].isin(on)]
+    rows_out, curves = [], []
+    for thr in thrs:
+        sel = bt[bt["prob"] >= thr]
+        cnt = sel.groupby("date").size()
+        sel = sel[~sel["date"].isin(set(cnt[cnt < MIN_HOLD].index))]
+        if sel.empty:
+            continue
+        m, curve = _hold_perf_from_selection(
+            sel["row"].to_numpy(), dates_all, bars_oc, bench, h,
+            f"Hold{h}P{thr:.2f}", label, max_dd)
+        if m is None:
+            continue
+        m["thr"] = thr
+        rows_out.append(m)
+        curves.append(curve)
     return (pd.DataFrame(rows_out),
             pd.concat(curves, ignore_index=True) if curves
             else pd.DataFrame())
 
 
 def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
-                     warm, year, dates, codes, nr_all, bars_oc, t0):
+                     warm, year, dates, codes, nr_all, bars_oc, t0,
+                     regime=None):
     """多周期模式: 每个horizon独立训练一个二分类模型(特征=全部请求组)
 
-    报告: valid AUC/logloss/acc + 全验证集逐日RankIC(对比T日实际收益)"""
+    报告: valid AUC/logloss/acc + 全验证集逐日RankIC(对比T日实际收益)
+    + 分年度验证表 + TopK/阈值两套重叠持仓回测.
+    --calibrate platt 时切分改为 2018~(CY-1)训练 / CY年校准 / (CY+1)~评估,
+    回测与阈值重搜都用校准后概率; regime/max_dd 作用于重叠持仓回测"""
     allg = tuple(groups)
     horizons = sorted(labels)
     log(f"horizon模式: 周期 {horizons}, 特征组 {list(allg)}")
@@ -445,9 +666,23 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
             dedup.append(c)
     cfgs = dedup
     log(f"配置 {len(cfgs)} 个: {[c[0] if len(c) == 1 else 'all' for c in cfgs]}")
+    calib = getattr(args, "calibrate", "none") != "none"
+    cy = int(getattr(args, "calib_year", 2023))
+    va_min_year = (cy + 1) if calib else int(TRAIN_END[:4]) + 1
+    tr_max_year = (cy - 1) if calib else int(TRAIN_END[:4])
+    age_ref = pd.Timestamp(f"{tr_max_year}-12-31")
+    if calib:
+        log(f"Platt校准流程: 训练2018~{tr_max_year} / 校准{cy}年 / "
+            f"评估{va_min_year}年起")
+    if regime is not None:
+        log(f"regime过滤开启: risk-off当天不开新仓 "
+            f"(回撤控制 max_dd={getattr(args, 'max_dd', 0.0)})")
+    hold_thrs = tuple(float(v) for v in
+                      getattr(args, "hold_thrs", "0.50,0.55,0.60").split(",")
+                      if v.strip())
     rs = np.random.RandomState(args.seed)
     vb = np.flatnonzero(np.isfinite(nr_all) & warm
-                        & ~(year <= int(TRAIN_END[:4])).values)
+                        & (year >= va_min_year).values)
     bench = pd.Series(nr_all[vb], index=dates[vb]).groupby(level=0).mean()
     log(f"市场基准: {len(bench)} 个交易日")
     rows, hold_all, hold_curves = [], [], []
@@ -455,22 +690,25 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
         R, Y, M0 = labels[h]
         M = M0 & warm
         yv = Y.astype(np.float32)
-        tr_all = np.flatnonzero(M & (year <= int(TRAIN_END[:4])).values)
-        va_all = np.flatnonzero(M & ~(year <= int(TRAIN_END[:4])).values)
+        tr_all = np.flatnonzero(M & (year <= tr_max_year).values)
+        va_all = np.flatnonzero(M & (year >= va_min_year).values)
+        cal_all = (np.flatnonzero(M & (year == cy).values) if calib
+                   else np.array([], dtype=int))
         tr_h = (np.sort(rs.choice(
             tr_all, size=min(args.train_sample, len(tr_all)),
             replace=False)) if args.train_sample else tr_all)
         va_h = (np.sort(rs.choice(
             va_all, size=min(args.valid_sample, len(va_all)),
             replace=False)) if args.valid_sample else va_all)
-        age = (pd.Timestamp(TRAIN_END)
-               - pd.to_datetime(dates[tr_h])).days.values
+        cal_h = cal_all
+        age = (age_ref - pd.to_datetime(dates[tr_h])).days.values
         w_h = (0.5 ** (age / 756.0)).astype(np.float32)
 
         def train_one(cfg, flabel):
             feat_names = [nm for g in cfg for nm in names[g]]
             log(f"[h={h}/{flabel}] 特征 {len(feat_names)}, "
-                f"训练 {len(tr_h):,} / 验证 {len(va_h):,}")
+                f"训练 {len(tr_h):,} / 验证 {len(va_h):,}"
+                + (f" / 校准 {len(cal_h):,}" if calib else ""))
             Xtr = build_config(names, cfg, tr_h)
             dtr = lgb.Dataset(Xtr, label=yv[tr_h], weight=w_h,
                               feature_name=feat_names)
@@ -487,9 +725,34 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
                            thermal_cb,
                            lgb.log_evaluation(200)])
             Xva = build_config(names, cfg, va_h)
-            p_va = model.predict(Xva, num_iteration=model.best_iteration)
+            p_raw = model.predict(Xva, num_iteration=model.best_iteration)
             del Xva
             gc.collect()
+            p_va = p_raw
+            prow = {}
+            if calib:
+                Xc = build_config(names, cfg, cal_h)
+                p_cal = model.predict(Xc,
+                                      num_iteration=model.best_iteration)
+                del Xc
+                gc.collect()
+                lr = fit_platt(p_cal, yv[cal_h])
+                p_va = apply_platt(lr, p_raw).astype(np.float64)
+                prow = {"platt_a": float(lr.coef_[0, 0]),
+                        "platt_b": float(lr.intercept_[0]),
+                        "calib_n": len(cal_h),
+                        "raw_logloss": log_loss(yv[va_h], p_raw),
+                        "raw_ece": ece_of(yv[va_h], p_raw),
+                        "logloss": log_loss(yv[va_h], p_va),
+                        "ece": ece_of(yv[va_h], p_va)}
+                log(f"[h={h}/{flabel}] Platt(a={prow['platt_a']:.3f},"
+                    f"b={prow['platt_b']:.3f}) 校准n={len(cal_h):,}: "
+                    f"LogLoss {prow['raw_logloss']:.4f}->"
+                    f"{prow['logloss']:.4f}, ECE {prow['raw_ece']:.4f}->"
+                    f"{prow['ece']:.4f}")
+                th = thr_table(yv[va_h], p_va)
+                log(f"[h={h}/{flabel}] 校准后阈值胜率: " + ", ".join(
+                    f"P≥{t:.2f} {v[0]:.4f}(n={v[1]:,})" for t, v in th.items()))
             bt = pd.DataFrame({"date": dates[va_h], "prob": p_va,
                                "next_ret": R[va_h]})
             ic = daily_ic(bt)
@@ -503,6 +766,16 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
                    "valid_acc": accuracy_score(yv[va_h], p_va > 0.5),
                    "base_rate": float(yv[va_h].mean()),
                    "ic": ic_mean, "ic_ir": ic_ir}
+            row.update(prow)
+            ytab = yearly_metrics(dates[va_h], yv[va_h], p_va, R[va_h])
+            log_yearly_table(ytab, f"h={h}/{flabel}")
+            for _, r in ytab.iterrows():
+                row[f"auc_{r['year']}"] = float(r["auc"])
+                row[f"ic_{r['year']}"] = float(r["ic"])
+            if model.best_iteration <= 5:
+                log(f"[h={h}/{flabel}] 提示: best_iter="
+                    f"{model.best_iteration} 接近单树, 上面的分年度表即"
+                    f"稳定性验证, 高IC需各年同号才算数")
             if h == 1 and not args.no_backtest:
                 bt2 = pd.DataFrame({
                     "date": dates[va_h], "code": codes[va_h], "prob": p_va,
@@ -520,13 +793,26 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
             if not args.no_backtest:
                 hs, hc = run_hold_backtest(
                     dates, codes, va_h, p_va, bars_oc, bench, h,
-                    topks=(10, 20, 50), label=f"h={h}/{flabel}")
+                    topks=(10, 20, 50), label=f"h={h}/{flabel}",
+                    regime=regime, max_dd=args.max_dd)
                 for _, m in hs.iterrows():
                     row[f"hold{m['K']}_ann"] = float(m["ann_net"])
                     row[f"hold{m['K']}_sharpe"] = float(m["sharpe"])
                     row[f"hold{m['K']}_mdd"] = float(m["mdd"])
                 hold_all.append(hs)
                 hold_curves.append(hc)
+                ts, tc = run_hold_threshold_backtest(
+                    dates, codes, va_h, p_va, bars_oc, bench, h,
+                    thrs=hold_thrs, label=f"h={h}/{flabel}",
+                    regime=regime, max_dd=args.max_dd)
+                for _, m in ts.iterrows():
+                    key = f"holdP{m['thr']:.2f}".replace(".", "")
+                    row[f"{key}_ann"] = float(m["ann_net"])
+                    row[f"{key}_sharpe"] = float(m["sharpe"])
+                    row[f"{key}_mdd"] = float(m["mdd"])
+                if len(ts):
+                    hold_all.append(ts)
+                    hold_curves.append(tc)
             rows.append(row)
             log(f"[h={h}/{flabel}] 完成: valid_auc {row['valid_auc']:.4f}, "
                 f"IC {row['ic']:.4f}, best_iter {row['best_iter']}, "
@@ -555,7 +841,213 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
               encoding="utf-8") as f:
         json.dump({"mode": "horizon", "groups": groups,
                    "horizons": horizons, "params": params,
-                   "limit": args.limit}, f, ensure_ascii=False, indent=2)
+                   "limit": args.limit,
+                   "fund_norm": getattr(args, "fund_norm", "cross"),
+                   "calibrate": getattr(args, "calibrate", "none"),
+                   "calib_year": getattr(args, "calib_year", 2023),
+                   "regime": getattr(args, "regime", "none"),
+                   "max_dd": getattr(args, "max_dd", 0.0),
+                   "hold_thrs": getattr(args, "hold_thrs", "0.50,0.55,0.60")},
+                  f, ensure_ascii=False, indent=2)
+    if not args.keep_features:
+        for g in names:
+            for suffix in (".npy", ".cols.json"):
+                try:
+                    os.remove(os.path.join(OUT_DIR, f"feat_{g}{suffix}"))
+                except OSError:
+                    pass
+    print(f"\n输出目录: {OUT_DIR}")
+    log(f"全部完成, 总用时 {(time.time() - t0) / 60:.1f} min")
+
+
+def run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
+                         warm, year, dates, codes, nr_all, bars_oc, t0,
+                         regime=None):
+    """walk-forward 多窗口 + holdout 定稿评估.
+
+    窗口: 对 --wf-valid-years 的每个验证年 vy, 用 2018~(vy-1) 训练、
+    vy 年验证; 最后用全量训练、2024+ holdout 定稿评估.
+    --calibrate platt 时最终模型改用 2018~(CY-1)训练 / CY年校准 / 评估."""
+    allg = tuple(groups)
+    horizons = sorted(labels)
+    vy_list = [int(v) for v in args.wf_valid_years.split(",") if v.strip()]
+    log(f"walk-forward: 验证年 {vy_list}, 周期 {horizons}, "
+        f"特征组 {list(allg)}")
+    calib = getattr(args, "calibrate", "none") != "none"
+    cy = int(getattr(args, "calib_year", 2023))
+    va_min_year = (cy + 1) if calib else int(TRAIN_END[:4]) + 1
+    tr_max_year = (cy - 1) if calib else int(TRAIN_END[:4])
+    hold_thrs = tuple(float(v) for v in
+                      getattr(args, "hold_thrs", "0.50,0.55,0.60").split(",")
+                      if v.strip())
+    rows, hold_all, hold_curves = [], [], []
+
+    def fit_window(R, yv, tr_idx, va_idx, w, h, tag, cal_idx=None,
+                   do_period=False):
+        feat_names = [nm for g in allg for nm in names[g]]
+        log(f"[h={h}/{tag}] 特征 {len(feat_names)}, 训练 {len(tr_idx):,} / "
+            f"验证 {len(va_idx):,}"
+            + (f" / 校准 {len(cal_idx):,}" if cal_idx is not None else ""))
+        Xtr = build_config(names, allg, tr_idx)
+        dtr = lgb.Dataset(Xtr, label=yv[tr_idx], weight=w,
+                          feature_name=feat_names)
+        del Xtr
+        gc.collect()
+        Xva = build_config(names, allg, va_idx)
+        dva = lgb.Dataset(Xva, label=yv[va_idx], reference=dtr)
+        del Xva
+        gc.collect()
+        model = lgb.train(
+            params, dtr, num_boost_round=args.rounds, valid_sets=[dva],
+            callbacks=[lgb.early_stopping(150, first_metric_only=True,
+                                          verbose=False),
+                       thermal_cb,
+                       lgb.log_evaluation(200)])
+        Xva = build_config(names, allg, va_idx)
+        p_raw = model.predict(Xva, num_iteration=model.best_iteration)
+        del Xva
+        gc.collect()
+        p_va = p_raw
+        prow = {}
+        if cal_idx is not None and len(cal_idx):
+            Xc = build_config(names, allg, cal_idx)
+            p_cal = model.predict(Xc, num_iteration=model.best_iteration)
+            del Xc
+            gc.collect()
+            lr = fit_platt(p_cal, yv[cal_idx])
+            p_va = apply_platt(lr, p_raw).astype(np.float64)
+            prow = {"platt_a": float(lr.coef_[0, 0]),
+                    "platt_b": float(lr.intercept_[0]),
+                    "calib_n": len(cal_idx),
+                    "raw_logloss": log_loss(yv[va_idx], p_raw),
+                    "logloss": log_loss(yv[va_idx], p_va),
+                    "ece": ece_of(yv[va_idx], p_va)}
+            log(f"[h={h}/{tag}] Platt: LogLoss {prow['raw_logloss']:.4f}->"
+                f"{prow['logloss']:.4f}, ECE {prow['ece']:.4f}")
+        bt = pd.DataFrame({"date": dates[va_idx], "prob": p_va,
+                           "next_ret": R[va_idx]})
+        ic = daily_ic(bt)
+        ic_mean = float(ic.mean()) if len(ic) else 0.0
+        row = {"horizon": h, "window": tag, "n_feat": len(feat_names),
+               "n_train": len(tr_idx), "n_valid": len(va_idx),
+               "best_iter": model.best_iteration,
+               "valid_auc": roc_auc_score(yv[va_idx], p_va),
+               "valid_logloss": log_loss(yv[va_idx], p_va),
+               "valid_acc": accuracy_score(yv[va_idx], p_va > 0.5),
+               "base_rate": float(yv[va_idx].mean()),
+               "ic": ic_mean,
+               "ic_ir": float(ic_mean / (ic.std() + 1e-12)) if len(ic) else 0.0}
+        row.update(prow)
+        ytab = yearly_metrics(dates[va_idx], yv[va_idx], p_va, R[va_idx])
+        log_yearly_table(ytab, f"h={h}/{tag}")
+        vb = np.flatnonzero(np.isfinite(nr_all) & warm
+                            & np.isin(year, ytab["year"].astype(int)
+                                      .to_numpy()))
+        bench = pd.Series(nr_all[vb], index=dates[vb]).groupby(level=0).mean()
+        if do_period and h == 1 and not args.no_backtest:
+            bt2 = pd.DataFrame({
+                "date": dates[va_idx], "code": codes[va_idx], "prob": p_va,
+                "next_ret": R[va_idx], "y": yv[va_idx]})
+            s, _, _, _, _, _ = run_period(bt2, f"h={h}/{tag}")
+            for strat in ("Top20", "Top50", "P>=0.55"):
+                m = s[s["strategy"] == strat]
+                if not m.empty:
+                    key = strat.replace(">=", "").replace(".", "")
+                    row[f"{key}_ann_net"] = float(m.iloc[0]["ann_net"])
+                    row[f"{key}_sharpe"] = float(m.iloc[0]["sharpe"])
+            row["mkt_ann_net"] = float(
+                s[s["strategy"] == "市场等权"].iloc[0]["ann_net"])
+            del bt2, s
+        if not args.no_backtest:
+            hs, hc = run_hold_backtest(
+                dates, codes, va_idx, p_va, bars_oc, bench, h,
+                topks=(10, 20, 50), label=f"h={h}/{tag}",
+                regime=regime, max_dd=args.max_dd)
+            for _, m in hs.iterrows():
+                row[f"hold{m['K']}_ann"] = float(m["ann_net"])
+                row[f"hold{m['K']}_sharpe"] = float(m["sharpe"])
+                row[f"hold{m['K']}_mdd"] = float(m["mdd"])
+            hold_all.append(hs)
+            hold_curves.append(hc)
+            ts, tc = run_hold_threshold_backtest(
+                dates, codes, va_idx, p_va, bars_oc, bench, h,
+                thrs=hold_thrs, label=f"h={h}/{tag}",
+                regime=regime, max_dd=args.max_dd)
+            for _, m in ts.iterrows():
+                key = f"holdP{m['thr']:.2f}".replace(".", "")
+                row[f"{key}_ann"] = float(m["ann_net"])
+                row[f"{key}_sharpe"] = float(m["sharpe"])
+                row[f"{key}_mdd"] = float(m["mdd"])
+            if len(ts):
+                hold_all.append(ts)
+                hold_curves.append(tc)
+        rows.append(row)
+        log(f"[h={h}/{tag}] 完成: valid_auc {row['valid_auc']:.4f}, "
+            f"IC {row['ic']:.4f}, best_iter {row['best_iter']}, "
+            f"用时 {(time.time() - t0) / 60:.1f} min")
+        model.save_model(os.path.join(
+            OUT_DIR, f"lgbm_wf_h{h}_{tag.replace('/', '_')}.txt"))
+        del dtr, dva, model, bt
+        gc.collect()
+
+    rs = np.random.RandomState(args.seed)
+    for h in horizons:
+        R, Y, M0 = labels[h]
+        M = M0 & warm
+        yv = Y.astype(np.float32)
+        for vy in vy_list:
+            tr_all = np.flatnonzero(M & (year <= vy - 1).values)
+            va_all = np.flatnonzero(M & (year == vy).values)
+            if len(tr_all) == 0 or len(va_all) == 0:
+                log(f"[h={h}/valid{vy}] 样本不足, 跳过")
+                continue
+            tr_i = (np.sort(rs.choice(
+                tr_all, size=min(args.train_sample, len(tr_all)),
+                replace=False)) if args.train_sample else tr_all)
+            va_i = (np.sort(rs.choice(
+                va_all, size=min(args.valid_sample, len(va_all)),
+                replace=False)) if args.valid_sample else va_all)
+            age = (pd.Timestamp(f"{vy - 1}-12-31")
+                   - pd.to_datetime(dates[tr_i])).days.values
+            w = (0.5 ** (age / 756.0)).astype(np.float32)
+            fit_window(R, yv, tr_i, va_i, w, h, f"train~{vy - 1}/valid{vy}")
+        tr_all = np.flatnonzero(M & (year <= tr_max_year).values)
+        va_all = np.flatnonzero(M & (year >= va_min_year).values)
+        cal_all = (np.flatnonzero(M & (year == cy).values) if calib
+                   else None)
+        tr_i = (np.sort(rs.choice(
+            tr_all, size=min(args.train_sample, len(tr_all)),
+            replace=False)) if args.train_sample else tr_all)
+        va_i = (np.sort(rs.choice(
+            va_all, size=min(args.valid_sample, len(va_all)),
+            replace=False)) if args.valid_sample else va_all)
+        age = (pd.Timestamp(f"{tr_max_year}-12-31")
+               - pd.to_datetime(dates[tr_i])).days.values
+        w = (0.5 ** (age / 756.0)).astype(np.float32)
+        fit_window(R, yv, tr_i, va_i, w, h, "holdout", cal_idx=cal_all,
+                   do_period=True)
+
+    res = pd.DataFrame(rows)
+    res.to_csv(os.path.join(OUT_DIR, "walkforward_results.csv"), index=False)
+    if hold_all:
+        pd.concat(hold_all, ignore_index=True).to_csv(
+            os.path.join(OUT_DIR, "holdbacktest_wf_summary.csv"), index=False)
+    if hold_curves:
+        pd.concat([c for c in hold_curves if len(c)], ignore_index=True).to_csv(
+            os.path.join(OUT_DIR, "holdbacktest_wf_daily.csv"), index=False)
+    print("\n================ walk-forward + holdout 结果 ================")
+    print(res.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    with open(os.path.join(OUT_DIR, "walkforward_run_config.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"mode": "walkforward", "groups": groups,
+                   "horizons": horizons, "valid_years": vy_list,
+                   "params": params, "limit": args.limit,
+                   "fund_norm": getattr(args, "fund_norm", "cross"),
+                   "calibrate": getattr(args, "calibrate", "none"),
+                   "calib_year": getattr(args, "calib_year", 2023),
+                   "regime": getattr(args, "regime", "none"),
+                   "max_dd": getattr(args, "max_dd", 0.0)},
+                  f, ensure_ascii=False, indent=2)
     if not args.keep_features:
         for g in names:
             for suffix in (".npy", ".cols.json"):
@@ -572,7 +1064,8 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="随机抽取N只股票(冒烟)")
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--mode", default="full",
-                    choices=["full", "single", "cum", "loo", "horizon"])
+                    choices=["full", "single", "cum", "loo", "horizon",
+                             "walkforward"])
     ap.add_argument("--horizons", default="1,5,10",
                     help="horizon模式的预测周期(天), 逗号分隔. "
                     "R_h=close[t+h]/open[t+1]-1")
@@ -599,12 +1092,34 @@ def main():
     ap.add_argument("--keep-features", action="store_true",
                     help="保留落盘的特征矩阵文件")
     ap.add_argument("--no-backtest", action="store_true")
+    ap.add_argument("--fund-norm", default="cross",
+                    choices=["none", "cross", "industry"],
+                    help="基本面横截面处理: none=原始值, cross=当日z-score, "
+                    "industry=行业中性化后z-score (只用t日横截面, PIT安全)")
+    ap.add_argument("--calibrate", default="none",
+                    choices=["none", "platt"],
+                    help="Platt校准: 2018~(CY-1)训练/CY年校准/(CY+1)~评估, "
+                    "回测与阈值重搜用校准后概率")
+    ap.add_argument("--calib-year", type=int, default=2023,
+                    help="校准年CY (默认2023)")
+    ap.add_argument("--regime", default="none",
+                    choices=["none", "breadth", "trend"],
+                    help="市场状态过滤: risk-off当天不开新仓(重叠持仓回测)")
+    ap.add_argument("--max-dd", type=float, default=0.0,
+                    help="因果回撤控制: 组合回撤跌破该值后空仓, 0=关闭")
+    ap.add_argument("--hold-thrs", default="0.50,0.55,0.60",
+                    help="阈值类重叠持仓回测的概率阈值, 逗号分隔")
+    ap.add_argument("--wf-valid-years", default="2022,2023",
+                    help="walk-forward验证年, 逗号分隔")
     args = ap.parse_args()
 
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
     for g in groups:
         if g not in GROUPS:
             raise SystemExit(f"未知特征组 {g}, 可选: {', '.join(GROUPS)}")
+    if "market" in groups:
+        log("警告: market 组是每日常数特征, 选股模型应剔除(见README §5.3/§11); "
+            "仅大盘择时研究时保留, 回测出现恒定预测/固定篮子即退化信号")
 
     os.makedirs(OUT_DIR, exist_ok=True)
     t0 = time.time()
@@ -641,6 +1156,10 @@ def main():
     put("tech", to_matrix(X, tech_cols), tech_cols)
     mkt_base = to_matrix(X, MKT_COLS)
     warm = ((year >= int(DATA_START[:4])) & X["ret60"].notna()).values
+    regime = None
+    if args.regime != "none":
+        regime = build_regime_series(dates, mkt_base, args.regime)
+        log(f"regime({args.regime}): risk-on {int(regime.sum())}/{len(regime)} 天")
     del X
     gc.collect()
 
@@ -655,7 +1174,7 @@ def main():
     bars_oc = np.stack([df["open"].to_numpy(dtype=np.float64),
                         df["close"].to_numpy(dtype=np.float64)], axis=1)
     labels = None
-    if args.mode == "horizon":
+    if args.mode in ("horizon", "walkforward"):
         horizons = [int(v) for v in args.horizons.split(",") if v.strip()]
         labels = build_multilabels(df, tradable, tuple(horizons))
         log(f"多周期标签: {sorted(labels)}")
@@ -682,8 +1201,17 @@ def main():
         gc.collect()
     if "fund" in groups:
         fund_mats, fund_names = build_fund_features(dates, codes)
-        put("fund", np.hstack(fund_mats), fund_names)
+        fund_mat = np.hstack(fund_mats)
         del fund_mats
+        gc.collect()
+        if args.fund_norm != "none":
+            ind_map = (load_industry_map()
+                       if args.fund_norm == "industry" else None)
+            log(f"基本面横截面标准化: {args.fund_norm} ...")
+            fund_mat = neutralize_fund_features(fund_mat, dates, codes,
+                                                args.fund_norm, ind_map)
+        put("fund", fund_mat, fund_names)
+        del fund_mat
         gc.collect()
     for g, builder in (("flow", build_flow_features),
                        ("margin", build_margin_features),
@@ -692,11 +1220,19 @@ def main():
         if g not in groups:
             continue
         mat, fn = builder(dates, codes)
-        if mat is None:
+        if mat is None or len(fn) == 0:
             log(f"警告: {g} 数据表为空, 跳过该组")
             groups.remove(g)
         else:
-            put(g, mat, fn)
+            finite = float(np.isfinite(
+                np.asarray(mat, dtype=np.float32)).mean())
+            if finite < 0.01:
+                log(f"警告: {g} 有效值仅 {finite:.2%}, 基本无信息量, 跳过该组")
+                groups.remove(g)
+                del mat
+                gc.collect()
+            else:
+                put(g, mat, fn)
 
     y_tr, y_va = y_all[tr_idx], y_all[va_idx]
     age = (pd.Timestamp(TRAIN_END) - pd.to_datetime(dates[tr_idx])).days.values
@@ -721,7 +1257,13 @@ def main():
 
     if args.mode == "horizon":
         run_horizon_mode(args, params, thermal_cb, groups, names, labels,
-                         warm, year, dates, codes, nr_all, bars_oc, t0)
+                         warm, year, dates, codes, nr_all, bars_oc, t0,
+                         regime=regime)
+        return
+    if args.mode == "walkforward":
+        run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
+                             warm, year, dates, codes, nr_all, bars_oc, t0,
+                             regime=regime)
         return
 
     configs = make_configs(args.mode, groups)
