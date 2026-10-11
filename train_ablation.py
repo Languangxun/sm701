@@ -36,6 +36,8 @@ LightGBM 特征组消融测试 (Ablation Study)
         # walk-forward多窗口(2022/2023验证)+2024+holdout定稿评估
     python3 train_ablation.py --mode horizon --calibrate platt --regime breadth --max-dd 0.15
         # Platt校准(2018-2022训练/2023校准/2024+评估)+状态过滤+回撤控制
+    python3 train_ablation.py --mode horizon --exec topen --groups tech
+        # 盘中信号锚定开盘价: 信号日=买入日/open[t]执行 (仅horizon/walkforward)
     python3 train_ablation.py --train-sample 3000000         # 手动采样加速
 """
 import argparse
@@ -401,11 +403,54 @@ def log_yearly_table(tab, label):
             f"acc={r['acc']:.4f} ic={r['ic']:.4f} (ic_n={r['ic_n']})")
 
 
-# ---------------------------------------------------------------- 多周期标签
-def build_multilabels(df, tradable, horizons=(1, 5, 10)):
-    """多周期标签: R_h = close[t+h]/open[t+1]-1 (t+1开盘买入, 持有h天)
+def shift_group_for_open_exec(mat, icode):
+    """topen口径特征前移: 每只股整体后移一行 (t行用t-1收盘及以前的特征),
+    每股首行填NaN. 调用方须另行补上当日开盘缺口 gap_t (9:25已知)."""
+    mat = np.asarray(mat, dtype=np.float32)
+    same = np.empty(len(icode), dtype=bool)
+    same[0] = False
+    same[1:] = icode[1:] == icode[:-1]
+    out = np.full_like(mat, np.nan)
+    out[1:] = np.where(same[1:, None], mat[:-1], np.nan)
+    return out
 
-    mask_h: 入场可买(tradable, 与t+1规则一致) 且持有窗内无>5天停牌
+
+# ---------------------------------------------------------------- 多周期标签
+def compute_tradable_open(df):
+    """t开盘可买 (盘中信号锚定开盘价口径): 当日有开盘、非开盘涨停封板、
+    距上一有行情日≤5天. 开盘价9:25集合竞价后已知, 当日可执行, 不算前视
+    (回测按开盘价成交为乐观估计, 实盘建议另加滑点)"""
+    n = len(df)
+    o = df["open"].to_numpy(dtype=np.float64)
+    c = df["close"].to_numpy(dtype=np.float64)
+    cd = df["code"].cat.codes.values
+    lim = df["lim"].values.astype(np.float64)
+    date_idx = pd.factorize(df["date"], sort=True)[0]
+    same_prev = np.empty(n, dtype=bool)
+    same_prev[0] = False
+    same_prev[1:] = cd[1:] == cd[:-1]
+    pc = np.full(n, np.nan, dtype=np.float64)
+    pc[same_prev] = c[np.where(same_prev)[0] - 1]
+    gap_prev = np.full(n, 999, dtype=np.int32)
+    gap_prev[same_prev] = (date_idx[same_prev]
+                           - date_idx[np.where(same_prev)[0] - 1])
+    log(f"t开盘可买样本占比 "
+        f"{float((np.isfinite(o) & np.isfinite(pc) & (gap_prev <= 5) & (o < pc * (1.0 + lim - 0.005))).mean()):.3f}")
+    return pd.Series(
+        np.isfinite(o) & np.isfinite(pc) & (gap_prev <= 5)
+        & (o < pc * (1.0 + lim - 0.005)), index=df.index)
+
+
+def build_multilabels(df, tradable, horizons=(1, 5, 10), exec_lag=1):
+    """多周期标签 (T+1执行, 无日内换仓)
+
+    exec_lag=1 (默认): t收盘信号、t+1开盘买, R_h = close[t+h]/open[t+1]-1
+    exec_lag=0 (盘中信号锚定开盘价): 信号日t=买入日、以open[t]为执行价,
+        R_h = close[t+h]/open[t]-1 (h>=1; T+1卖出规则下最短过夜到t+1收盘,
+        持仓共h+1段). 此时传入的tradable须是t开盘口径
+        (见compute_tradable_open)
+
+    mask_h: 入场可买(tradable, 与执行口径一致) 且持有窗内无>5天停牌
             且i+h仍是同只股票. R为float32(NaN=无效), Y为R>0"""
     n = len(df)
     o = df["open"].to_numpy(dtype=np.float64)
@@ -425,7 +470,10 @@ def build_multilabels(df, tradable, horizons=(1, 5, 10)):
         idx = np.arange(n - h)
         same = cd[idx] == cd[idx + h]
         sel = idx[same]
-        R[sel] = c[sel + h] / o[sel + 1] - 1.0
+        if exec_lag == 1:
+            R[sel] = c[sel + h] / o[sel + 1] - 1.0
+        else:
+            R[sel] = c[sel + h] / o[sel] - 1.0
         m = np.zeros(n, dtype=bool)
         m[sel] = (cbad[sel + h] - cbad[sel] == 0)
         m &= np.isfinite(R) & entry
@@ -531,21 +579,26 @@ def build_regime_series(dates, mkt_base, kind="breadth"):
 
 
 def _hold_perf_from_selection(sel_rows, dates_all, bars_oc, bench, h,
-                              strategy, label, max_dd=0.0):
+                              strategy, label, max_dd=0.0, buy_lag=1):
     """由信号行 vintage 构造重叠持仓曲线 (单策略).
 
+    buy_lag=1: t+1开盘买, 持h段 (默认, 与R_h=close[t+h]/open[t+1]-1一致)
+    buy_lag=0: 信号日t开盘买 (盘中信号锚定开盘价), 持h+1段至t+h收盘,
+        与R_h=close[t+h]/open[t]-1一致
     max_dd > 0 时做因果回撤控制: 组合相对峰值回撤跌破 -max_dd 后空仓,
     直到回到阈值内 (逐日顺序模拟, 无前视)"""
     o_full, c_full = bars_oc[:, 0], bars_oc[:, 1]
     r0 = np.asarray(sel_rows)
     if len(r0) == 0:
         return None, None
-    e, x = r0 + 1, r0 + h
-    rr = np.empty((len(r0), h), dtype=np.float64)
+    e = r0 + buy_lag
+    n_seg = h if buy_lag == 1 else h + 1
+    x = e + n_seg - 1
+    rr = np.empty((len(r0), n_seg), dtype=np.float64)
     rr[:, 0] = c_full[e] / o_full[e] - 1.0
-    for k in range(1, h):
+    for k in range(1, n_seg):
         rr[:, k] = c_full[e + k] / c_full[e + k - 1] - 1.0
-    dd = np.stack([dates_all[e[i]:e[i] + h] for i in range(len(r0))])
+    dd = np.stack([dates_all[e[i]:e[i] + n_seg] for i in range(len(r0))])
     long = pd.DataFrame({"date": dd.ravel(), "ret": rr.ravel()})
     g = long.groupby("date")["ret"].mean()
     act = long.groupby("date").size()
@@ -579,11 +632,12 @@ def _hold_perf_from_selection(sel_rows, dates_all, bars_oc, bench, h,
 
 def run_hold_backtest(dates_all, codes_all, mask_rows, prob, bars_oc,
                       bench, h, topks=(10, 20, 50), label="",
-                      regime=None, max_dd=0.0):
+                      regime=None, max_dd=0.0, buy_lag=1):
     """重叠持仓回测: 每个信号日t收盘选TopK, t+1开盘买入持有h天(t+h收盘卖)
 
     每日组合收益=在持vintage当日收益的等权平均; 成本按进/出分摊
     (每端COST/2, 与run_period的单程COST口径一致). 仍是T+1调仓, 无日内.
+    buy_lag=0 时为盘中信号锚定开盘价口径 (信号日t开盘买, 持h+1段).
     regime 非空时 risk-off 当天不开新仓; max_dd>0 时做因果回撤控制"""
     bt = pd.DataFrame({"date": dates_all[mask_rows],
                        "code": codes_all[mask_rows],
@@ -600,7 +654,7 @@ def run_hold_backtest(dates_all, codes_all, mask_rows, prob, bars_oc,
             continue
         m, curve = _hold_perf_from_selection(
             sel["row"].to_numpy(), dates_all, bars_oc, bench, h,
-            f"Hold{h}Top{K}", label, max_dd)
+            f"Hold{h}Top{K}", label, max_dd, buy_lag)
         if m is None:
             continue
         m["K"] = K
@@ -614,9 +668,46 @@ def run_hold_backtest(dates_all, codes_all, mask_rows, prob, bars_oc,
 def run_hold_threshold_backtest(dates_all, codes_all, mask_rows, prob,
                                 bars_oc, bench, h,
                                 thrs=(0.50, 0.55, 0.60), label="",
-                                regime=None, max_dd=0.0):
-    """阈值类重叠持仓回测: 信号日选 prob>=thr (入选不足 MIN_HOLD 只则当天空仓),
-    t+1开盘买入持有h天; 每日组合=在持vintage等权平均; 成本与 TopK 口径一致"""
+                                regime=None, max_dd=0.0, buy_lag=1,
+                                min_n=MIN_HOLD, min_cov=0.0):
+    """阈值类重叠持仓回测: 信号日选 prob>=thr (入选不足 min_n 只则当天空仓),
+    t+1开盘买入持有h天; 每日组合=在持vintage等权平均; 成本与 TopK 口径一致.
+    buy_lag=0 时为盘中信号锚定开盘价口径 (信号日t开盘买, 持h+1段).
+    min_cov>0 时覆盖天数不足的策略整行丢弃 (杀小样本假象); 每行附带
+    cover (有持仓信号日占比) 与 active_days 供审查"""
+    bt = pd.DataFrame({"date": dates_all[mask_rows],
+                       "code": codes_all[mask_rows],
+                       "prob": prob, "row": mask_rows})
+    if regime is not None:
+        on = set(regime[regime].index)
+        bt = bt[bt["date"].isin(on)]
+    all_days = pd.Series(dates_all[mask_rows]).nunique()
+    rows_out, curves = [], []
+    for thr in thrs:
+        sel = bt[bt["prob"] >= thr]
+        cnt = sel.groupby("date").size()
+        sel = sel[~sel["date"].isin(set(cnt[cnt < min_n].index))]
+        if sel.empty:
+            continue
+        active_days = int(sel["date"].nunique())
+        cover = active_days / max(int(all_days), 1)
+        if cover < min_cov:
+            log(f"[{label}/P{thr:.2f}] 覆盖 {cover:.1%} < {min_cov:.0%}, "
+                f"丢弃 (小样本假象)")
+            continue
+        m, curve = _hold_perf_from_selection(
+            sel["row"].to_numpy(), dates_all, bars_oc, bench, h,
+            f"Hold{h}P{thr:.2f}", label, max_dd, buy_lag)
+        if m is None:
+            continue
+        m["thr"] = thr
+        m["cover"] = cover
+        m["active_days"] = active_days
+        rows_out.append(m)
+        curves.append(curve)
+    return (pd.DataFrame(rows_out),
+            pd.concat(curves, ignore_index=True) if curves
+            else pd.DataFrame())
     bt = pd.DataFrame({"date": dates_all[mask_rows],
                        "code": codes_all[mask_rows],
                        "prob": prob, "row": mask_rows})
@@ -632,7 +723,7 @@ def run_hold_threshold_backtest(dates_all, codes_all, mask_rows, prob,
             continue
         m, curve = _hold_perf_from_selection(
             sel["row"].to_numpy(), dates_all, bars_oc, bench, h,
-            f"Hold{h}P{thr:.2f}", label, max_dd)
+            f"Hold{h}P{thr:.2f}", label, max_dd, buy_lag)
         if m is None:
             continue
         m["thr"] = thr
@@ -680,6 +771,11 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
     hold_thrs = tuple(float(v) for v in
                       getattr(args, "hold_thrs", "0.50,0.55,0.60").split(",")
                       if v.strip())
+    buy_lag = 1 if getattr(args, "exec", "t1open") == "t1open" else 0
+    psuf = "" if buy_lag == 1 else "@open"
+    if buy_lag == 0:
+        log("执行口径: 盘中信号锚定开盘价 (信号日=买入日, open[t]执行, "
+            "R_h=close[t+h]/open[t]-1)")
     rs = np.random.RandomState(args.seed)
     vb = np.flatnonzero(np.isfinite(nr_all) & warm
                         & (year >= va_min_year).values)
@@ -703,6 +799,10 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
         cal_h = cal_all
         age = (age_ref - pd.to_datetime(dates[tr_h])).days.values
         w_h = (0.5 ** (age / 756.0)).astype(np.float32)
+        bench_h = bench
+        if buy_lag == 0:
+            rb = np.flatnonzero(M & (year >= va_min_year).values)
+            bench_h = pd.Series(R[rb], index=dates[rb]).groupby(level=0).mean()
 
         def train_one(cfg, flabel):
             feat_names = [nm for g in cfg for nm in names[g]]
@@ -780,7 +880,7 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
                 bt2 = pd.DataFrame({
                     "date": dates[va_h], "code": codes[va_h], "prob": p_va,
                     "next_ret": R[va_h], "y": yv[va_h]})
-                s, _, _, _, _, _ = run_period(bt2, f"h={h}/{flabel}")
+                s, _, _, _, _, _ = run_period(bt2, f"h={h}/{flabel}{psuf}")
                 for strat in ("Top20", "Top50", "P>=0.55"):
                     m = s[s["strategy"] == strat]
                     if not m.empty:
@@ -792,9 +892,9 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
                 del bt2, s
             if not args.no_backtest:
                 hs, hc = run_hold_backtest(
-                    dates, codes, va_h, p_va, bars_oc, bench, h,
-                    topks=(10, 20, 50), label=f"h={h}/{flabel}",
-                    regime=regime, max_dd=args.max_dd)
+                    dates, codes, va_h, p_va, bars_oc, bench_h, h,
+                    topks=(10, 20, 50), label=f"h={h}/{flabel}{psuf}",
+                    regime=regime, max_dd=args.max_dd, buy_lag=buy_lag)
                 for _, m in hs.iterrows():
                     row[f"hold{m['K']}_ann"] = float(m["ann_net"])
                     row[f"hold{m['K']}_sharpe"] = float(m["sharpe"])
@@ -802,14 +902,16 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
                 hold_all.append(hs)
                 hold_curves.append(hc)
                 ts, tc = run_hold_threshold_backtest(
-                    dates, codes, va_h, p_va, bars_oc, bench, h,
-                    thrs=hold_thrs, label=f"h={h}/{flabel}",
-                    regime=regime, max_dd=args.max_dd)
+                    dates, codes, va_h, p_va, bars_oc, bench_h, h,
+                    thrs=hold_thrs, label=f"h={h}/{flabel}{psuf}",
+                    regime=regime, max_dd=args.max_dd, buy_lag=buy_lag,
+                    min_n=args.hold_min_n, min_cov=args.hold_min_cov)
                 for _, m in ts.iterrows():
                     key = f"holdP{m['thr']:.2f}".replace(".", "")
                     row[f"{key}_ann"] = float(m["ann_net"])
                     row[f"{key}_sharpe"] = float(m["sharpe"])
                     row[f"{key}_mdd"] = float(m["mdd"])
+                    row[f"{key}_cov"] = float(m["cover"])
                 if len(ts):
                     hold_all.append(ts)
                     hold_curves.append(tc)
@@ -847,7 +949,8 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
                    "calib_year": getattr(args, "calib_year", 2023),
                    "regime": getattr(args, "regime", "none"),
                    "max_dd": getattr(args, "max_dd", 0.0),
-                   "hold_thrs": getattr(args, "hold_thrs", "0.50,0.55,0.60")},
+                   "hold_thrs": getattr(args, "hold_thrs", "0.50,0.55,0.60"),
+                   "exec": getattr(args, "exec", "t1open")},
                   f, ensure_ascii=False, indent=2)
     if not args.keep_features:
         for g in names:
@@ -880,6 +983,11 @@ def run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
     hold_thrs = tuple(float(v) for v in
                       getattr(args, "hold_thrs", "0.50,0.55,0.60").split(",")
                       if v.strip())
+    buy_lag = 1 if getattr(args, "exec", "t1open") == "t1open" else 0
+    psuf = "" if buy_lag == 1 else "@open"
+    if buy_lag == 0:
+        log("执行口径: 盘中信号锚定开盘价 (信号日=买入日, open[t]执行, "
+            "R_h=close[t+h]/open[t]-1)")
     rows, hold_all, hold_curves = [], [], []
 
     def fit_window(R, yv, tr_idx, va_idx, w, h, tag, cal_idx=None,
@@ -944,11 +1052,14 @@ def run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
                             & np.isin(year, ytab["year"].astype(int)
                                       .to_numpy()))
         bench = pd.Series(nr_all[vb], index=dates[vb]).groupby(level=0).mean()
+        if buy_lag == 0:
+            bench = pd.Series(R[va_idx], index=dates[va_idx]
+                              ).groupby(level=0).mean()
         if do_period and h == 1 and not args.no_backtest:
             bt2 = pd.DataFrame({
                 "date": dates[va_idx], "code": codes[va_idx], "prob": p_va,
                 "next_ret": R[va_idx], "y": yv[va_idx]})
-            s, _, _, _, _, _ = run_period(bt2, f"h={h}/{tag}")
+            s, _, _, _, _, _ = run_period(bt2, f"h={h}/{tag}{psuf}")
             for strat in ("Top20", "Top50", "P>=0.55"):
                 m = s[s["strategy"] == strat]
                 if not m.empty:
@@ -961,8 +1072,8 @@ def run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
         if not args.no_backtest:
             hs, hc = run_hold_backtest(
                 dates, codes, va_idx, p_va, bars_oc, bench, h,
-                topks=(10, 20, 50), label=f"h={h}/{tag}",
-                regime=regime, max_dd=args.max_dd)
+                topks=(10, 20, 50), label=f"h={h}/{tag}{psuf}",
+                regime=regime, max_dd=args.max_dd, buy_lag=buy_lag)
             for _, m in hs.iterrows():
                 row[f"hold{m['K']}_ann"] = float(m["ann_net"])
                 row[f"hold{m['K']}_sharpe"] = float(m["sharpe"])
@@ -971,13 +1082,15 @@ def run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
             hold_curves.append(hc)
             ts, tc = run_hold_threshold_backtest(
                 dates, codes, va_idx, p_va, bars_oc, bench, h,
-                thrs=hold_thrs, label=f"h={h}/{tag}",
-                regime=regime, max_dd=args.max_dd)
+                thrs=hold_thrs, label=f"h={h}/{tag}{psuf}",
+                regime=regime, max_dd=args.max_dd, buy_lag=buy_lag,
+                min_n=args.hold_min_n, min_cov=args.hold_min_cov)
             for _, m in ts.iterrows():
                 key = f"holdP{m['thr']:.2f}".replace(".", "")
                 row[f"{key}_ann"] = float(m["ann_net"])
                 row[f"{key}_sharpe"] = float(m["sharpe"])
                 row[f"{key}_mdd"] = float(m["mdd"])
+                row[f"{key}_cov"] = float(m["cover"])
             if len(ts):
                 hold_all.append(ts)
                 hold_curves.append(tc)
@@ -1046,7 +1159,8 @@ def run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
                    "calibrate": getattr(args, "calibrate", "none"),
                    "calib_year": getattr(args, "calib_year", 2023),
                    "regime": getattr(args, "regime", "none"),
-                   "max_dd": getattr(args, "max_dd", 0.0)},
+                   "max_dd": getattr(args, "max_dd", 0.0),
+                   "exec": getattr(args, "exec", "t1open")},
                   f, ensure_ascii=False, indent=2)
     if not args.keep_features:
         for g in names:
@@ -1092,10 +1206,12 @@ def main():
     ap.add_argument("--keep-features", action="store_true",
                     help="保留落盘的特征矩阵文件")
     ap.add_argument("--no-backtest", action="store_true")
-    ap.add_argument("--fund-norm", default="cross",
+    ap.add_argument("--fund-norm", default="none",
                     choices=["none", "cross", "industry"],
-                    help="基本面横截面处理: none=原始值, cross=当日z-score, "
-                    "industry=行业中性化后z-score (只用t日横截面, PIT安全)")
+                    help="基本面横截面处理: none=原始值 (默认, walk-forward裁决: "
+                    "树模型不需要标准化, cross会洗掉全市场估值水位本身的"
+                    "牛熊信息); cross=当日z-score, industry=行业中性化后"
+                    "z-score (只用t日横截面, PIT安全)")
     ap.add_argument("--calibrate", default="none",
                     choices=["none", "platt"],
                     help="Platt校准: 2018~(CY-1)训练/CY年校准/(CY+1)~评估, "
@@ -1109,14 +1225,27 @@ def main():
                     help="因果回撤控制: 组合回撤跌破该值后空仓, 0=关闭")
     ap.add_argument("--hold-thrs", default="0.50,0.55,0.60",
                     help="阈值类重叠持仓回测的概率阈值, 逗号分隔")
+    ap.add_argument("--hold-min-n", type=int, default=5,
+                    help="阈值策略单日最少入选只数, 不足则当天空仓")
+    ap.add_argument("--hold-min-cov", type=float, default=0.2,
+                    help="阈值策略最小覆盖天数占比, 不足整行丢弃 (杀小样本假象; "
+                    "walk-forward实证: 835%/14993%类极值覆盖均<15%)")
     ap.add_argument("--wf-valid-years", default="2022,2023",
                     help="walk-forward验证年, 逗号分隔")
+    ap.add_argument("--exec", default="t1open",
+                    choices=["t1open", "topen"],
+                    help="执行口径: t1open=t收盘信号/t+1开盘买 "
+                    "(R=close[t+h]/open[t+1]-1); topen=盘中信号锚定开盘价, "
+                    "信号日=买入日/open[t]执行 (R=close[t+h]/open[t]-1), "
+                    "仅horizon/walkforward可用")
     args = ap.parse_args()
 
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
     for g in groups:
         if g not in GROUPS:
             raise SystemExit(f"未知特征组 {g}, 可选: {', '.join(GROUPS)}")
+    if args.exec != "t1open" and args.mode not in ("horizon", "walkforward"):
+        raise SystemExit("--exec topen 仅 horizon/walkforward 模式可用")
     if "market" in groups:
         log("警告: market 组是每日常数特征, 选股模型应剔除(见README §5.3/§11); "
             "仅大盘择时研究时保留, 回测出现恒定预测/固定篮子即退化信号")
@@ -1131,6 +1260,20 @@ def main():
     code_cat = df["code"].cat.categories.to_numpy()
     codes = code_cat[df["code"].cat.codes.to_numpy()]
     n = len(df)
+    gap_t = None
+    if args.exec == "topen":
+        # 当日开盘缺口 (9:25集合竞价后已知, topen口径下唯一可用的当日信息)
+        o = df["open"].to_numpy(dtype=np.float64)
+        c = df["close"].to_numpy(dtype=np.float64)
+        cd = df["code"].cat.codes.values
+        same = np.empty(n, dtype=bool)
+        same[0] = False
+        same[1:] = cd[1:] == cd[:-1]
+        gap_t = np.full(n, np.nan, dtype=np.float32)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            gap_t[same] = (o[same] / c[np.where(same)[0] - 1] - 1.0)
+        del o, c, cd, same
+        gc.collect()
 
     base = ((year >= int(DATA_START[:4])) & next_ret.notna() & tradable
             & X["ret60"].notna()).values
@@ -1159,6 +1302,9 @@ def main():
     regime = None
     if args.regime != "none":
         regime = build_regime_series(dates, mkt_base, args.regime)
+        if args.exec == "topen":
+            # topen口径: 9:25时t收盘未知, 状态用上一交易日的 (首日默认开仓)
+            regime = regime.shift(1).fillna(True)
         log(f"regime({args.regime}): risk-on {int(regime.sum())}/{len(regime)} 天")
     del X
     gc.collect()
@@ -1176,7 +1322,13 @@ def main():
     labels = None
     if args.mode in ("horizon", "walkforward"):
         horizons = [int(v) for v in args.horizons.split(",") if v.strip()]
-        labels = build_multilabels(df, tradable, tuple(horizons))
+        if args.exec == "topen":
+            log("执行口径: 盘中信号锚定开盘价 (信号日=买入日, open[t]执行)")
+            labels = build_multilabels(df, compute_tradable_open(df),
+                                       tuple(horizons), exec_lag=0)
+        else:
+            labels = build_multilabels(df, tradable, tuple(horizons),
+                                       exec_lag=1)
         log(f"多周期标签: {sorted(labels)}")
         for h, (R, Y, M) in labels.items():
             log(f"  h={h}: 训练 {(M & (year <= int(TRAIN_END[:4])).values).sum():,} / "
@@ -1233,6 +1385,31 @@ def main():
                 gc.collect()
             else:
                 put(g, mat, fn)
+
+    if args.exec == "topen":
+        # topen口径: 9:25时t收盘未知, 所有特征组按股前移一日
+        # (t行用t-1收盘及以前), 再补上当日开盘缺口gap_t (tech组末列)
+        log("执行口径topen: 特征按股前移一日 + 补gap_t ...")
+        icode = pd.factorize(codes)[0]
+        for g in list(names):
+            p = os.path.join(OUT_DIR, f"feat_{g}.npy")
+            mat = np.load(p)
+            mat = shift_group_for_open_exec(mat, icode)
+            if g == "tech":
+                mat = np.hstack([mat, np.asarray(gap_t, dtype=np.float32)
+                                 [:, None]])
+                names[g] = list(names[g]) + ["gap_t"]
+                with open(os.path.join(OUT_DIR, "feat_tech.cols.json"), "w",
+                          encoding="utf-8") as f:
+                    json.dump(list(names[g]), f, ensure_ascii=False)
+                log(f"特征组 tech: {len(names[g])} 列 (含gap_t)")
+            np.save(p, mat)
+            del mat
+            gc.collect()
+        del icode
+        gc.collect()
+    del gap_t
+    gc.collect()
 
     y_tr, y_va = y_all[tr_idx], y_all[va_idx]
     age = (pd.Timestamp(TRAIN_END) - pd.to_datetime(dates[tr_idx])).days.values

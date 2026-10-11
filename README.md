@@ -177,7 +177,7 @@ mkt1/mkt5/mkt20/breadth5（全市场等权收益+上涨家数占比）＋ 4 个�
 ### 5.5 fund（29 列）：基本面
 - 估值 7 列（`fund_valuation` 按日精确对齐、缺失向前填）：ep=1/pe_ttm（clip±1）、bp=1/pb（0–5）、sp=1/ps、cfp=1/pcf、peg、log_mv、float_ratio。
 - 财报 22 列（`fund_indicator_em` **按 NOTICE_DATE−1 天 asof**，只用公告日严格早于 t 的报告）：roe、roe_kcfj、毛利率/净利率/ROA、营收/净利/扣非同比、eps、bps、ocf_ps、资产负债率、流动/速动比率、现金流占比、经营现金流/营收、应收/营收、周转天数（总资产/存货/应收）、roic、total_roi。极端值截断 ±1000，缺失保留 NaN 给 LightGBM。
-- 横截面处理（`train_ablation.py --fund-norm`，只用 t 日当天横截面，PIT 安全）：`cross`（默认，当日 z-score）/`industry`（先减行业内均值再除当日标准差，clip ±5，无映射行退回全市场均值）；`none` 为原始值。日内有效样本 <10 或标准差 ~0 的列跳过。
+- 横截面处理（`train_ablation.py --fund-norm`，只用 t 日当天横截面，PIT 安全）：`none`（默认）、`cross`（当日 z-score）/`industry`（先减行业内均值再除当日标准差，clip ±5，无映射行退回全市场均值）。walk-forward 三档裁决（2026-10-11，见 §11.7）：none 在 h=5/h=10 六个窗口+holdout 上全部最优或持平——树模型不需要标准化，cross 会洗掉全市场估值水位本身的牛熊信息。日内有效样本 <10 或标准差 ~0 的列跳过。
 - 百度长历史估值、新浪 86 指标、财务摘要：**训练未用**（周频/无公告日）。
 
 ### 5.6 flow（7 列）：资金流
@@ -236,7 +236,7 @@ mkt1/mkt5/mkt20/breadth5（全市场等权收益+上涨家数占比）＋ 4 个�
 |---|---|---|
 | `lgbm_train_backtest.py` | LGBM 基线（44 技术特征）+ 训练/验证分段回测 | `--limit/--rounds/--leaves/--lr` |
 | `lgbm_tcn_ensemble.py` | LGBM 复用 + TCN 训练 + 三路回测对比 | `--lookback/--channels/--dilations/--tcn-weight/--device/--resume` |
-| `train_ablation.py` | **主脚本**：9 特征组消融 + 多周期 + walk-forward | `--mode full/single/cum/loo/horizon/walkforward`，`--groups`（默认 `tech,pattern,industry,fund`，market 默认不进选股），`--horizons 1,5,10`，`--per-group`，`--fund-norm cross/industry/none`，`--calibrate platt --calib-year 2023`，`--regime breadth/trend --max-dd`，`--hold-thrs`，`--wf-valid-years`，`--train-sample/--valid-sample`（0=全量），`--threads/--throttle/--temp-limit/--temp-resume` |
+| `train_ablation.py` | **主脚本**：9 特征组消融 + 多周期 + walk-forward | `--mode full/single/cum/loo/horizon/walkforward`，`--groups`（默认 `tech,pattern,industry,fund`，market 默认不进选股），`--horizons 1,5,10`，`--per-group`，`--fund-norm none/cross/industry`（默认 none，三档裁决见 §5.5），`--calibrate platt --calib-year 2023`，`--regime breadth/trend --max-dd`，`--hold-thrs`，`--wf-valid-years`，`--train-sample/--valid-sample`（0=全量），`--threads/--throttle/--temp-limit/--temp-resume` |
 | `train_tcn_pattern.py` | TCN（序列）vs LGBM（标量）对照：pattern/tech/tech+pattern 同采样对比 | `--configs/--lookback/--epochs/--batch-size/--skip-lgbm/--no-parallel` |
 | `analyze_lhb.py` | 龙虎榜深挖：分年度/分月/股票池对照/IC | 直接运行 |
 | `features_extra.py` | flow/margin/lhb/events 四组构建器（被消融脚本调用） | — |
@@ -334,6 +334,11 @@ LGBM+TCN 概率融合与排名融合均跑过（见 `ensemble_output/`）；受 
 - 阈值持有初判（`Hold{h}P{thr}`）：可信档 `h=10/fund P0.55 55%/1.38`、P0.60 62.8%/1.11，`h=1/tech P0.60 34%/1.12`，`h=1/pattern P0.60 45%/1.09`；`h=1/market P0.55 272%`、`h=1/industry P0.55 363%`、`h=1/all P0.60 421%` 为高阈值极小样本假象，**不可信**，阈值策略必须配最小样本/覆盖天数门槛（待办，见 §17-5）。
 - 其余与 §11.1–11.2 一致：tech 仍是真实技能最强（T+1 0.5440 / T+5 0.5560 / T+10 0.5645），industry IC 为负，market 退化。生产定稿见 §18。
 
+### 11.7 walk-forward 三档裁决（2026-10-11，tech+pattern+industry+fund，窗口 2022/2023 + holdout）
+- fund-norm：**none 全胜或持平**——h=5 三窗口 AUC 0.5680/0.5720/0.5441（IC 0.082/0.050/0.034），h=10 三窗口 0.5997/0.5957/0.5560（IC 0.123/0.084/0.074）；cross 在 h=5/h=10 六个窗口上全部垫底（0.5469–0.5939）。结论：树模型不需要标准化，cross 洗掉了全市场估值水位（牛熊）本身的信息量；默认改回 none，cross/industry 留作研究选项。
+- 阈值门槛实证（`cover` 列）：`Hold5P0.60 14993%/cover 0.15%/1 天`、`Hold1P0.60 835%/7%/17 天`、`Hold5P0.55 121%/7.7%/51 天`——极值全是低覆盖假象；可信档覆盖均 >45%（如 `h=10/holdout P0.60 32%/49%/321 天`）。`--hold-min-cov` 默认 **0.2**（覆盖不足整行丢弃）。
+- h=5/holdout 三档 best_iter 全 ≤15（弱学习，早停个位数树），h=5 的 holdout 结论以窗口验证为准。
+
 ---
 
 ## 12. 概率校准
@@ -411,9 +416,9 @@ Platt/Isotonic 实验（2024 拟合 → 2025–2026 评估，223 万样本，`re
 
 1. `flow`（资金流）覆盖仍待补数据：构建侧现打印覆盖率（只数/宇宙/日期段），不足 50% 告警；有效值 <1% 的组训练时自动跳过；`fetch_extra_data.py` 对 flow 提至 ≥5 次重试 + 退避上限 120s + 缺 `NO_PROXY` 时提示绕行。网络好时用 `NO_PROXY=.eastmoney.com` 重跑 `fetch_extra_data.py --datasets flow`。
 2. 选股默认组已剔除 `market`（`--groups` 默认 `tech,pattern,industry,fund`）；手动指定 `market` 会打印禁入选股警告（每日常数→早期分裂趋同→TopK 退化，仅择时研究保留）。
-3. 基本面：`--fund-norm cross`（默认，当日 z-score，PIT 安全）/`industry`（行业中性化后 z-score，clip ±5）；horizon/walkforward 打印分年度 AUC/acc/IC 表；`best_iter≤5` 自动提示单树早停、以分年度稳定性为准。
+3. 基本面：`--fund-norm` 默认 `none`（walk-forward 三档裁决，见 §11.7）；`cross`/`industry` 保留作研究选项（只用 t 日横截面，PIT 安全，clip ±5）；horizon/walkforward 打印分年度 AUC/acc/IC 表；`best_iter≤5` 自动提示单树早停、以分年度稳定性为准。
 4. 定稿流程：`--mode walkforward`（`--wf-valid-years 2022,2023` 窗口 + 2024+ holdout）；Platt：`--calibrate platt`（2018–2022 训练/2023 校准/2024+ 评估，回测与阈值重搜用校准概率，报告 LogLoss/ECE 前后对比）；lhb/fund 高 beta 组合：`--regime breadth|trend`（risk-off 不开新仓）+ `--max-dd`（因果回撤控制）。
-5. T+5/T+10 阈值类重叠持仓回测已实现（`--hold-thrs 0.50,0.55,0.60`，`Hold{h}P{thr}` 策略，入选不足 5 只当天空仓，成本/regime/回撤口径与 TopK 一致）。后续：阈值策略加最小样本/覆盖天数门槛（本轮 market/industry 高阈值极小样本收益率不可信，见 §11.6）。
+5. T+5/T+10 阈值类重叠持仓回测已实现（`--hold-thrs 0.50,0.55,0.60`，`Hold{h}P{thr}` 策略，入选不足 `--hold-min-n`（默认 5）只当天空仓，成本/regime/回撤口径与 TopK 一致）。门槛已落地：`--hold-min-cov` 默认 0.2（覆盖不足整行丢弃；实证见 §11.7：14993%/1 天、835%/17 天类极值覆盖均 <15%）。
 
 ---
 
@@ -435,5 +440,5 @@ man = json.load(open("production/features_tech.json"))
 booster = lgb.Booster(model_file="production/prod_h1_tech.txt")
 p = booster.predict(X)  # X 列序按 man["features"]
 ```
-- 执行与回测一致（T+1：t 收盘出信号、t+1 开盘成交，成本万 15，剔除 t+1 开盘涨停封板）；阈值参考 §11.6 可信档（`h=1/tech P0.60`、`h=10/fund P0.55`，生产 tech 主用 P0.60 档思路，需自定最小样本门槛）。
+- 执行与回测一致（T+1：t 收盘出信号、t+1 开盘成交，成本万 15，剔除 t+1 开盘涨停封板）；阈值参考 §11.6–11.7 可信档（`h=1/tech P0.60`、`h=10/fund P0.55`），阈值策略强制 `--hold-min-cov 0.2`（默认）过滤小样本假象。
 - 风险：结论全部处于 2024–2026 牛市样本内（基准年化 33.4%）；lhb/fund 类高 beta 组合上生产必须配 `--regime` 过滤与 `--max-dd` 回撤控制；建议 walk-forward + holdout 复核后再放量。
