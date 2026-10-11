@@ -1229,7 +1229,7 @@ def main():
                     help="阈值策略单日最少入选只数, 不足则当天空仓")
     ap.add_argument("--hold-min-cov", type=float, default=0.2,
                     help="阈值策略最小覆盖天数占比, 不足整行丢弃 (杀小样本假象; "
-                    "walk-forward实证: 835%/14993%类极值覆盖均<15%)")
+                    "walk-forward实证: 835%%/14993%%类极值覆盖均<15%%)")
     ap.add_argument("--wf-valid-years", default="2022,2023",
                     help="walk-forward验证年, 逗号分隔")
     ap.add_argument("--exec", default="t1open",
