@@ -24,6 +24,7 @@
 15. [环境与运行命令](#15-环境与运行命令)
 16. [输出文件说明](#16-输出文件说明)
 17. [已知限制与下一步](#17-已知限制与下一步)
+18. [生产定稿](#18-生产定稿)
 
 ---
 
@@ -328,6 +329,11 @@ TCN 只在 pattern 序列（形态组合）上略胜；TCN 的 P≥0.55 回测 4
 ### 11.5 融合
 LGBM+TCN 概率融合与排名融合均跑过（见 `ensemble_output/`）；受 TCN 未校准拖累（见 §12），提升有限。
 
+### 11.6 新一轮全量（2026-10-11，fund-norm cross 默认，27 配置，flow 有效值 <1% 自动跳过）
+- fund 组变化：`h=1/fund` best_iter 1→377（AUC 0.5084，不再单树）、`h=10/fund` best_iter 1→116（AUC 0.5288 / IC 0.0589）；`h=5/fund` 仍单树（0.5167）。
+- 阈值持有初判（`Hold{h}P{thr}`）：可信档 `h=10/fund P0.55 55%/1.38`、P0.60 62.8%/1.11，`h=1/tech P0.60 34%/1.12`，`h=1/pattern P0.60 45%/1.09`；`h=1/market P0.55 272%`、`h=1/industry P0.55 363%`、`h=1/all P0.60 421%` 为高阈值极小样本假象，**不可信**，阈值策略必须配最小样本/覆盖天数门槛（待办，见 §17-5）。
+- 其余与 §11.1–11.2 一致：tech 仍是真实技能最强（T+1 0.5440 / T+5 0.5560 / T+10 0.5645），industry IC 为负，market 退化。生产定稿见 §18。
+
 ---
 
 ## 12. 概率校准
@@ -395,6 +401,7 @@ Platt/Isotonic 实验（2024 拟合 → 2025–2026 评估，223 万样本，`re
 | `lgbm_output/` | LGBM 基线：模型/重要度/回测汇总/逐日净值/分档/年AUC/**逐样本验证预测**（校准用） |
 | `ensemble_output/` | LGBM+TCN：三路评估与回测、融合权重扫描、逐样本预测 |
 | `ablation_output/` | 消融：`ablation_results.csv`（排序对比）、`ablation_importance.csv`、`horizon_results.csv`（+`config`列/分年度 `auc_年`/`ic_年`列/`holdP*`阈值持有列）、`holdbacktest_summary/daily.csv`（TopK + `Hold{h}P{thr}` 阈值策略）、`walkforward_results.csv` + `holdbacktest_wf_*`（walk-forward 窗口与 holdout）、`lgbm_all.txt`、`lgbm_h{h}[_all].txt`、`lhb_deepdive.md`、`lhb_monthly.csv`、`run_config.json` |
+| `production/` | **生产定稿**：`prod_h1/h5/h10_tech.txt`（三周期 tech 模型，见 §18）+ `features_tech.json`（40 特征名/列序） |
 | `tcn_output/` | `tcn_results.csv`、`backtest_report.md`、`backtest_summary.csv` |
 | `reports/` | 清洗报告 / 校准评估 / 校准对比（日期命名） |
 
@@ -406,4 +413,27 @@ Platt/Isotonic 实验（2024 拟合 → 2025–2026 评估，223 万样本，`re
 2. 选股默认组已剔除 `market`（`--groups` 默认 `tech,pattern,industry,fund`）；手动指定 `market` 会打印禁入选股警告（每日常数→早期分裂趋同→TopK 退化，仅择时研究保留）。
 3. 基本面：`--fund-norm cross`（默认，当日 z-score，PIT 安全）/`industry`（行业中性化后 z-score，clip ±5）；horizon/walkforward 打印分年度 AUC/acc/IC 表；`best_iter≤5` 自动提示单树早停、以分年度稳定性为准。
 4. 定稿流程：`--mode walkforward`（`--wf-valid-years 2022,2023` 窗口 + 2024+ holdout）；Platt：`--calibrate platt`（2018–2022 训练/2023 校准/2024+ 评估，回测与阈值重搜用校准概率，报告 LogLoss/ECE 前后对比）；lhb/fund 高 beta 组合：`--regime breadth|trend`（risk-off 不开新仓）+ `--max-dd`（因果回撤控制）。
-5. T+5/T+10 阈值类重叠持仓回测已实现（`--hold-thrs 0.50,0.55,0.60`，`Hold{h}P{thr}` 策略，入选不足 5 只当天空仓，成本/regime/回撤口径与 TopK 一致）。
+5. T+5/T+10 阈值类重叠持仓回测已实现（`--hold-thrs 0.50,0.55,0.60`，`Hold{h}P{thr}` 策略，入选不足 5 只当天空仓，成本/regime/回撤口径与 TopK 一致）。后续：阈值策略加最小样本/覆盖天数门槛（本轮 market/industry 高阈值极小样本收益率不可信，见 §11.6）。
+
+---
+
+## 18. 生产定稿
+
+2026-10-11 全量（27 配置）按**真实排序技能**取最强：三周期均为 **tech**（all 的 T+10 AUC 0.60 系指数择时虚高、不用；lhb/fund 高收益系股票池 beta、不用；阈值极值系小样本假象、不用）。
+
+| 周期 | 模型 | 验证 AUC / IC | best_iter |
+|---|---|---|---|
+| T+1 | `production/prod_h1_tech.txt` | 0.5440 / 0.0145 | 1566 |
+| T+5 | `production/prod_h5_tech.txt` | 0.5560 / 0.0461 | 1998 |
+| T+10 | `production/prod_h10_tech.txt` | 0.5645 / 0.0665 | 1600 |
+
+- 输入：tech 40 特征（定义 §5.1），**列序以 `production/features_tech.json` 为准**，float32、缺失填 NaN；特征口径与 `lgbm_train_backtest._compute_feats` 完全一致（t 及以前、横截面排名限当日）。
+- 推理：
+```python
+import json, lightgbm as lgb
+man = json.load(open("production/features_tech.json"))
+booster = lgb.Booster(model_file="production/prod_h1_tech.txt")
+p = booster.predict(X)  # X 列序按 man["features"]
+```
+- 执行与回测一致（T+1：t 收盘出信号、t+1 开盘成交，成本万 15，剔除 t+1 开盘涨停封板）；阈值参考 §11.6 可信档（`h=1/tech P0.60`、`h=10/fund P0.55`，生产 tech 主用 P0.60 档思路，需自定最小样本门槛）。
+- 风险：结论全部处于 2024–2026 牛市样本内（基准年化 33.4%）；lhb/fund 类高 beta 组合上生产必须配 `--regime` 过滤与 `--max-dd` 回撤控制；建议 walk-forward + holdout 复核后再放量。
