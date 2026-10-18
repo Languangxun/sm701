@@ -872,8 +872,7 @@ def run_horizon_mode(args, params, groups, names, labels,
                 **train_kw,
                 callbacks=[lgb.early_stopping(150, first_metric_only=True,
                                               verbose=False),
-                           thermal_cb,
-                           lgb.log_evaluation(200)])
+                       lgb.log_evaluation(200)])
             Xva = build_config(names, cfg, va_h)
             p_raw = model.predict(Xva, num_iteration=model.best_iteration)
             if rankic_mode and label_type in ("binary", "cross_binary"):
