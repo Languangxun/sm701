@@ -236,7 +236,7 @@ mkt1/mkt5/mkt20/breadth5（全市场等权收益+上涨家数占比）＋ 4 个�
 |---|---|---|
 | `lgbm_train_backtest.py` | LGBM 基线（44 技术特征）+ 训练/验证分段回测 | `--limit/--rounds/--leaves/--lr` |
 | `lgbm_tcn_ensemble.py` | LGBM 复用 + TCN 训练 + 三路回测对比 | `--lookback/--channels/--dilations/--tcn-weight/--device/--resume` |
-| `train_ablation.py` | **主脚本**：9 特征组消融 + 多周期 + walk-forward | `--mode full/single/cum/loo/horizon/walkforward`，`--groups`（默认 `tech,pattern,industry,fund`，market 默认不进选股），`--horizons 1,5,10`，`--per-group`，`--fund-norm none/cross/industry`（默认 none，三档裁决见 §5.5），`--calibrate platt --calib-year 2023`，`--regime breadth/trend --max-dd`，`--hold-thrs`，`--wf-valid-years`，`--train-sample/--valid-sample`（0=全量），`--threads/--throttle/--temp-limit/--temp-resume` |
+| `train_ablation.py` | **主脚本**：9 特征组消融 + 多周期 + walk-forward | `--mode full/single/cum/loo/horizon/walkforward`，`--groups`（默认 `tech,pattern,industry,fund`，market 默认不进选股），`--horizons 1,5,10`，`--per-group`，`--fund-norm none/cross/industry`（默认 none，三档裁决见 §5.5），`--calibrate platt --calib-year 2023`，`--regime breadth/trend --max-dd`，`--hold-thrs`，`--liquidity --liq-min-amount --liq-max-turnover-pct --liq-impact-bps`（Top5 流动性/容量约束），`--wf-valid-years`，`--train-sample/--valid-sample`（0=全量），`--threads/--throttle/--temp-limit/--temp-resume` |
 | `train_tcn_pattern.py` | TCN（序列）vs LGBM（标量）对照：pattern/tech/tech+pattern 同采样对比 | `--configs/--lookback/--epochs/--batch-size/--skip-lgbm/--no-parallel` |
 | `analyze_lhb.py` | 龙虎榜深挖：分年度/分月/股票池对照/IC | 直接运行 |
 | `features_extra.py` | flow/margin/lhb/events 四组构建器（被消融脚本调用） | — |
@@ -391,6 +391,7 @@ Platt/Isotonic 实验（2024 拟合 → 2025–2026 评估，223 万样本，`re
 - 全量消融：`python3 train_ablation.py --mode full`（13 配置，~1.5h；9 组 25 配置约 2–3h）
 - 多周期：`python3 train_ablation.py --mode horizon --groups tech,pattern,industry,fund,flow,margin,lhb,events`（T+1/5/10，~1h；market 只在显式指定时加入，默认不进选股）；加 `--per-group` 找每周期最强组（30 模型，~3–4h）
 - walk-forward：`python3 train_ablation.py --mode walkforward --wf-valid-years 2022,2023`（多窗口验证 + 2024+ holdout 定稿评估）
+- walk-forward + Top5 流动性/容量约束：`python3 train_ablation.py --mode walkforward --groups tech --horizons 1,5,10 --liquidity --liq-min-amount 10000000 --liq-max-turnover-pct 0.05`（日成交额 ≥1000 万、单票仓位 ≤5% 日成交额）
 - 校准+风控：`--calibrate platt --calib-year 2023`（2018–2022 训练/2023 校准/2024+ 评估，回测用校准概率）+ `--regime breadth --max-dd 0.15`
 - TCN 对比：`python3 train_tcn_pattern.py --configs pattern,tech,tech+pattern --epochs 5`（GPU）
 - 龙虎榜深挖：`python3 analyze_lhb.py` → `ablation_output/lhb_deepdive.md`
@@ -419,6 +420,7 @@ Platt/Isotonic 实验（2024 拟合 → 2025–2026 评估，223 万样本，`re
 3. 基本面：`--fund-norm` 默认 `none`（walk-forward 三档裁决，见 §11.7）；`cross`/`industry` 保留作研究选项（只用 t 日横截面，PIT 安全，clip ±5）；horizon/walkforward 打印分年度 AUC/acc/IC 表；`best_iter≤5` 自动提示单树早停、以分年度稳定性为准。
 4. 定稿流程：`--mode walkforward`（`--wf-valid-years 2022,2023` 窗口 + 2024+ holdout）；Platt：`--calibrate platt`（2018–2022 训练/2023 校准/2024+ 评估，回测与阈值重搜用校准概率，报告 LogLoss/ECE 前后对比）；lhb/fund 高 beta 组合：`--regime breadth|trend`（risk-off 不开新仓）+ `--max-dd`（因果回撤控制）。
 5. T+5/T+10 阈值类重叠持仓回测已实现（`--hold-thrs 0.50,0.55,0.60`，`Hold{h}P{thr}` 策略，入选不足 `--hold-min-n`（默认 5）只当天空仓，成本/regime/回撤口径与 TopK 一致）。门槛已落地：`--hold-min-cov` 默认 0.2（覆盖不足整行丢弃；实证见 §11.7：14993%/1 天、835%/17 天类极值覆盖均 <15%）。
+6. Top5 流动性/容量约束已加入（`--liquidity`）：按信号日 t 的成交额过滤，要求日成交额 ≥`--liq-min-amount` 且单票仓位 ≤`--liq-max-turnover-pct` 日成交额（保守假设组合净值=1）；约束前后同时输出 `Hold{h}Top5` 与 `Hold{h}Top5Liq`，便于比较容量代价。冲击成本参数 `--liq-impact-bps` 预留，当前默认 0。
 
 ---
 

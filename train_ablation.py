@@ -630,36 +630,67 @@ def _hold_perf_from_selection(sel_rows, dates_all, bars_oc, bench, h,
     return m, curve
 
 
+def _liquidity_amount_thr(K, liquidity):
+    """TopK 流动性/容量联合阈值(元): 日成交额 >= max(下限, 1/(K*max_pct))."""
+    if liquidity is None:
+        return 0.0
+    cap = 1.0 / (K * liquidity.get("max_turnover_pct", 0.05))
+    return max(liquidity.get("min_amount", 0.0), cap)
+
+
 def run_hold_backtest(dates_all, codes_all, mask_rows, prob, bars_oc,
-                      bench, h, topks=(10, 20, 50), label="",
-                      regime=None, max_dd=0.0, buy_lag=1):
+                      bench, h, topks=(5, 10, 20, 50), label="",
+                      regime=None, max_dd=0.0, buy_lag=1,
+                      bars_amt=None, liquidity=None):
     """重叠持仓回测: 每个信号日t收盘选TopK, t+1开盘买入持有h天(t+h收盘卖)
 
     每日组合收益=在持vintage当日收益的等权平均; 成本按进/出分摊
     (每端COST/2, 与run_period的单程COST口径一致). 仍是T+1调仓, 无日内.
     buy_lag=0 时为盘中信号锚定开盘价口径 (信号日t开盘买, 持h+1段).
-    regime 非空时 risk-off 当天不开新仓; max_dd>0 时做因果回撤控制"""
+    regime 非空时 risk-off 当天不开新仓; max_dd>0 时做因果回撤控制.
+    liquidity 非空时对 K==5 额外做流动性/容量过滤, 输出 Hold{h}Top5Liq"""
     bt = pd.DataFrame({"date": dates_all[mask_rows],
                        "code": codes_all[mask_rows],
                        "prob": prob, "row": mask_rows})
-    bt["rk"] = bt.groupby("date")["prob"].rank(ascending=False,
-                                               method="first")
     if regime is not None:
         on = set(regime[regime].index)
         bt = bt[bt["date"].isin(on)]
-    rows_out, curves = [], []
-    for K in topks:
-        sel = bt[bt["rk"] <= K]
+    def _run_one_K(df_sub, K, name):
+        sel = df_sub[df_sub["rk"] <= K]
         if sel.empty:
-            continue
+            return
         m, curve = _hold_perf_from_selection(
             sel["row"].to_numpy(), dates_all, bars_oc, bench, h,
-            f"Hold{h}Top{K}", label, max_dd, buy_lag)
+            name, label, max_dd, buy_lag)
         if m is None:
-            continue
+            return
         m["K"] = K
         rows_out.append(m)
         curves.append(curve)
+
+    rows_out, curves = [], []
+    for K in topks:
+        base = bt.copy()
+        base["rk"] = base.groupby("date")["prob"].rank(ascending=False,
+                                                       method="first")
+        # 先生成无流动性约束的 Top5
+        if K == 5 and liquidity is not None and bars_amt is not None:
+            _run_one_K(base, K, f"Hold{h}Top{K}")
+            # 再生成流动性约束后的 Top5Liq
+            thr = _liquidity_amount_thr(K, liquidity)
+            liq_ok = bars_amt[base["row"].to_numpy()] >= thr
+            liq = base[liq_ok].copy()
+            if not liq.empty:
+                liq["rk"] = liq.groupby("date")["prob"].rank(
+                    ascending=False, method="first")
+                n_drop = (~liq_ok).sum()
+                log(f"[{label}/Hold{h}Top{K}Liq] 流动性过滤剔除 {n_drop:,} 行 "
+                    f"(thr>= {thr:,.0f} 元)")
+                _run_one_K(liq, K, f"Hold{h}Top{K}Liq")
+            else:
+                log(f"[{label}] Top5 流动性过滤后无候选 (thr={thr:,.0f})")
+        else:
+            _run_one_K(base, K, f"Hold{h}Top{K}")
     return (pd.DataFrame(rows_out),
             pd.concat(curves, ignore_index=True) if curves
             else pd.DataFrame())
@@ -708,35 +739,11 @@ def run_hold_threshold_backtest(dates_all, codes_all, mask_rows, prob,
     return (pd.DataFrame(rows_out),
             pd.concat(curves, ignore_index=True) if curves
             else pd.DataFrame())
-    bt = pd.DataFrame({"date": dates_all[mask_rows],
-                       "code": codes_all[mask_rows],
-                       "prob": prob, "row": mask_rows})
-    if regime is not None:
-        on = set(regime[regime].index)
-        bt = bt[bt["date"].isin(on)]
-    rows_out, curves = [], []
-    for thr in thrs:
-        sel = bt[bt["prob"] >= thr]
-        cnt = sel.groupby("date").size()
-        sel = sel[~sel["date"].isin(set(cnt[cnt < MIN_HOLD].index))]
-        if sel.empty:
-            continue
-        m, curve = _hold_perf_from_selection(
-            sel["row"].to_numpy(), dates_all, bars_oc, bench, h,
-            f"Hold{h}P{thr:.2f}", label, max_dd, buy_lag)
-        if m is None:
-            continue
-        m["thr"] = thr
-        rows_out.append(m)
-        curves.append(curve)
-    return (pd.DataFrame(rows_out),
-            pd.concat(curves, ignore_index=True) if curves
-            else pd.DataFrame())
 
 
 def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
                      warm, year, dates, codes, nr_all, bars_oc, t0,
-                     regime=None):
+                     regime=None, bars_amt=None, liquidity=None):
     """多周期模式: 每个horizon独立训练一个二分类模型(特征=全部请求组)
 
     报告: valid AUC/logloss/acc + 全验证集逐日RankIC(对比T日实际收益)
@@ -893,12 +900,14 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
             if not args.no_backtest:
                 hs, hc = run_hold_backtest(
                     dates, codes, va_h, p_va, bars_oc, bench_h, h,
-                    topks=(10, 20, 50), label=f"h={h}/{flabel}{psuf}",
-                    regime=regime, max_dd=args.max_dd, buy_lag=buy_lag)
+                    topks=(5, 10, 20, 50), label=f"h={h}/{flabel}{psuf}",
+                    regime=regime, max_dd=args.max_dd, buy_lag=buy_lag,
+                    bars_amt=bars_amt, liquidity=liquidity)
                 for _, m in hs.iterrows():
-                    row[f"hold{m['K']}_ann"] = float(m["ann_net"])
-                    row[f"hold{m['K']}_sharpe"] = float(m["sharpe"])
-                    row[f"hold{m['K']}_mdd"] = float(m["mdd"])
+                    key = "liq" if "Liq" in str(m.get("strategy", "")) else m['K']
+                    row[f"hold{key}_ann"] = float(m["ann_net"])
+                    row[f"hold{key}_sharpe"] = float(m["sharpe"])
+                    row[f"hold{key}_mdd"] = float(m["mdd"])
                 hold_all.append(hs)
                 hold_curves.append(hc)
                 ts, tc = run_hold_threshold_backtest(
@@ -965,7 +974,7 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
 
 def run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
                          warm, year, dates, codes, nr_all, bars_oc, t0,
-                         regime=None):
+                         regime=None, bars_amt=None, liquidity=None):
     """walk-forward 多窗口 + holdout 定稿评估.
 
     窗口: 对 --wf-valid-years 的每个验证年 vy, 用 2018~(vy-1) 训练、
@@ -1072,12 +1081,14 @@ def run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
         if not args.no_backtest:
             hs, hc = run_hold_backtest(
                 dates, codes, va_idx, p_va, bars_oc, bench, h,
-                topks=(10, 20, 50), label=f"h={h}/{tag}{psuf}",
-                regime=regime, max_dd=args.max_dd, buy_lag=buy_lag)
+                topks=(5, 10, 20, 50), label=f"h={h}/{tag}{psuf}",
+                regime=regime, max_dd=args.max_dd, buy_lag=buy_lag,
+                bars_amt=bars_amt, liquidity=liquidity)
             for _, m in hs.iterrows():
-                row[f"hold{m['K']}_ann"] = float(m["ann_net"])
-                row[f"hold{m['K']}_sharpe"] = float(m["sharpe"])
-                row[f"hold{m['K']}_mdd"] = float(m["mdd"])
+                key = "liq" if "Liq" in str(m.get("strategy", "")) else m['K']
+                row[f"hold{key}_ann"] = float(m["ann_net"])
+                row[f"hold{key}_sharpe"] = float(m["sharpe"])
+                row[f"hold{key}_mdd"] = float(m["mdd"])
             hold_all.append(hs)
             hold_curves.append(hc)
             ts, tc = run_hold_threshold_backtest(
@@ -1230,6 +1241,15 @@ def main():
     ap.add_argument("--hold-min-cov", type=float, default=0.2,
                     help="阈值策略最小覆盖天数占比, 不足整行丢弃 (杀小样本假象; "
                     "walk-forward实证: 835%%/14993%%类极值覆盖均<15%%)")
+    ap.add_argument("--liquidity", action="store_true",
+                    help="对 Top5 额外施加流动性/容量约束 (生成 Hold{h}Top5Liq)")
+    ap.add_argument("--liq-min-amount", type=float, default=10_000_000.0,
+                    help="Top5 流动性约束: 个股日成交额下限(元), 默认1000万")
+    ap.add_argument("--liq-max-turnover-pct", type=float, default=0.05,
+                    help="Top5 容量约束: 单票仓位占个股日成交额上限, 默认5%%")
+    ap.add_argument("--liq-impact-bps", type=float, default=0.0,
+                    help="Top5 冲击成本附加(年化双边bps), 默认0; 例如10表示在"
+                    "成交额不足时额外扣10bps成本")
     ap.add_argument("--wf-valid-years", default="2022,2023",
                     help="walk-forward验证年, 逗号分隔")
     ap.add_argument("--exec", default="t1open",
@@ -1319,6 +1339,18 @@ def main():
     nr_all = next_ret.to_numpy(dtype=np.float32)
     bars_oc = np.stack([df["open"].to_numpy(dtype=np.float64),
                         df["close"].to_numpy(dtype=np.float64)], axis=1)
+    bars_amt = (df["vol"].to_numpy(dtype=np.float64)
+                * df["close"].to_numpy(dtype=np.float64))
+    liquidity = None
+    if args.liquidity:
+        liquidity = {
+            "min_amount": args.liq_min_amount,
+            "max_turnover_pct": args.liq_max_turnover_pct,
+            "impact_bps": args.liq_impact_bps,
+        }
+        log(f"Top5 流动性约束: 日成交额 >= {args.liq_min_amount:,.0f} 元, "
+            f"容量 <= {args.liq_max_turnover_pct:.1%} 日成交额, "
+            f"冲击成本 +{args.liq_impact_bps:.1f} bps")
     labels = None
     if args.mode in ("horizon", "walkforward"):
         horizons = [int(v) for v in args.horizons.split(",") if v.strip()]
@@ -1435,12 +1467,14 @@ def main():
     if args.mode == "horizon":
         run_horizon_mode(args, params, thermal_cb, groups, names, labels,
                          warm, year, dates, codes, nr_all, bars_oc, t0,
-                         regime=regime)
+                         regime=regime, bars_amt=bars_amt,
+                         liquidity=liquidity)
         return
     if args.mode == "walkforward":
         run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
                              warm, year, dates, codes, nr_all, bars_oc, t0,
-                             regime=regime)
+                             regime=regime, bars_amt=bars_amt,
+                             liquidity=liquidity)
         return
 
     configs = make_configs(args.mode, groups)
