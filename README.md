@@ -208,7 +208,10 @@ mkt1/mkt5/mkt20/breadth5（全市场等权收益+上涨家数占比）＋ 4 个�
 
 ## 6. 标签与样本切分
 
-- **标签**：`R_h = close[t+h]/open[t+1] − 1`（t+1 开盘买入、持有 h 天），`y = R_h > 0`。h=1/5/10。
+- **未来收益**：`R_h = close[t+h]/open[t+1] − 1`（t+1 开盘买入、持有 h 天），h=1/5/10。
+- **标签（默认 `cross_binary`）**：每日截面上对 `R_h` 做分位排名，`y = 1` 当且仅当 `R_h` 高于当日中位数。这是纯选股标签，剥离了大盘择时成分，与 RankIC 评估口径一致。
+  - 可选 `--label-type binary`：`y = R_h > 0`（预测“大盘+选股”，AUC 意义更大但 IC 对不上）。
+  - 可选 `--label-type cross_rank`：截面排名的 rank-gauss 变换，回归目标。
 - **可交易门槛**（与 t+1 规则一致，沿用原脚本）：次日有行情、停牌间隔 ≤5 天、t+1 开盘非涨停封板（`open1 < close·(1+lim−0.005)`）。
   - 涨跌停幅度：主板 10%、创业板/科创板 20%、北交所 30%、ST 5%；**创业板 20% 仅 2020-08-24 起**（之前 10%，69 万根已按日期分段修正）；ST 按当前名称回溯（含历史误差，仅影响样本筛选）。
   - h>1 额外要求：持有窗内无 >5 天停牌、i+h 仍是同只股票。
@@ -236,7 +239,7 @@ mkt1/mkt5/mkt20/breadth5（全市场等权收益+上涨家数占比）＋ 4 个�
 |---|---|---|
 | `lgbm_train_backtest.py` | LGBM 基线（44 技术特征）+ 训练/验证分段回测 | `--limit/--rounds/--leaves/--lr` |
 | `lgbm_tcn_ensemble.py` | LGBM 复用 + TCN 训练 + 三路回测对比 | `--lookback/--channels/--dilations/--tcn-weight/--device/--resume` |
-| `train_ablation.py` | **主脚本**：9 特征组消融 + 多周期 + walk-forward | `--mode full/single/cum/loo/horizon/walkforward`，`--groups`（默认 `tech,pattern,industry,fund`，market 默认不进选股），`--horizons 1,5,10`，`--per-group`，`--fund-norm none/cross/industry`（默认 none，三档裁决见 §5.5），`--calibrate platt --calib-year 2023`，`--regime breadth/trend --max-dd`，`--hold-thrs`，`--liquidity --liq-min-amount --liq-max-turnover-pct --liq-impact-bps`（Top5 流动性/容量约束），`--wf-valid-years`，`--train-sample/--valid-sample`（0=全量），`--threads/--throttle/--temp-limit/--temp-resume` |
+| `train_ablation.py` | **主脚本**：9 特征组消融 + 多周期 + walk-forward | `--mode full/single/cum/loo/horizon/walkforward`，`--groups`（默认 `tech,pattern,industry,fund`，market 默认不进选股），`--horizons 1,5,10`，`--per-group`，`--label-type cross_binary/binary/cross_rank`（默认 cross_binary，见 §6），`--fund-norm none/cross/industry`（默认 none，三档裁决见 §5.5），`--calibrate platt --calib-year 2023`，`--regime breadth/trend --max-dd`，`--hold-thrs`，`--liquidity --liq-min-amount --liq-max-turnover-pct --liq-impact-bps`（Top5 流动性/容量约束），`--wf-valid-years`，`--train-sample/--valid-sample`（0=全量），`--threads` |
 | `train_tcn_pattern.py` | TCN（序列）vs LGBM（标量）对照：pattern/tech/tech+pattern 同采样对比 | `--configs/--lookback/--epochs/--batch-size/--skip-lgbm/--no-parallel` |
 | `analyze_lhb.py` | 龙虎榜深挖：分年度/分月/股票池对照/IC | 直接运行 |
 | `features_extra.py` | flow/margin/lhb/events 四组构建器（被消融脚本调用） | — |
@@ -339,6 +342,21 @@ LGBM+TCN 概率融合与排名融合均跑过（见 `ensemble_output/`）；受 
 - 阈值门槛实证（`cover` 列）：`Hold5P0.60 14993%/cover 0.15%/1 天`、`Hold1P0.60 835%/7%/17 天`、`Hold5P0.55 121%/7.7%/51 天`——极值全是低覆盖假象；可信档覆盖均 >45%（如 `h=10/holdout P0.60 32%/49%/321 天`）。`--hold-min-cov` 默认 **0.2**（覆盖不足整行丢弃）。
 - h=5/holdout 三档 best_iter 全 ≤15（弱学习，早停个位数树），h=5 的 holdout 结论以窗口验证为准。
 
+### 11.8 截面标签 cross_binary 验证（2026-10-18，tech 单组，walk-forward 2022/2023 + holdout）
+
+把默认标签从 `binary(R>0)` 改为 `cross_binary(截面跑赢中位数)`，holdout（2024+）对比：
+
+| h | AUC_base | AUC_cross | dAUC | IC_base | IC_cross | dIC | ICIR_base | ICIR_cross | dICIR |
+|---|----------|-----------|------|---------|----------|-----|-----------|------------|-------|
+| 1 | 0.5423 | **0.5258** | −0.0165 | 0.0101 | **0.0482** | **+0.0381** | 0.1078 | **0.3819** | +0.2742 |
+| 5 | 0.5521 | **0.5439** | −0.0082 | 0.0456 | **0.0915** | **+0.0459** | 0.3477 | **0.5647** | +0.2170 |
+| 10 | 0.5628 | **0.5516** | −0.0112 | 0.0672 | **0.1079** | **+0.0407** | 0.6270 | **0.6270** | +0.0000 |
+
+- AUC 下降符合预期：截面标签不预测大盘涨跌，只关心同日内谁排前面。
+- IC 在三个周期均提升约 **0.04**，h=10 达到 0.1079；ICIR 在 h=1/h=5 显著改善。
+- h=1 Top20 年化净收益：binary **−8.5%** → cross_binary **+2.38%**。
+- 默认标签已改为 `cross_binary`；`binary` 保留作择时/复合研究选项。
+
 ---
 
 ## 12. 概率校准
@@ -378,7 +396,7 @@ Platt/Isotonic 实验（2024 拟合 → 2025–2026 评估，223 万样本，`re
 
 ## 14. 运维工具
 
-- **温度看门狗**（`lgbm_train_backtest.thermal_wait/ThermalCallback`，读 coretemp hwmon）：`--temp-limit/--temp-resume` 超温自动挂起降温（`--throttle` 每轮/每批休眠，`--threads` 限线程）。MX350（Pascal, sm_61）可用 CUDA；注意整机散热——本机待机 76–80°C，曾因 3.2GHz 全核 + 训练触发过热强关。
+- **温度控制已移除**：`thermal_wait` / `ThermalCallback` / `--throttle` 已删除，训练不再因 CPU 温度挂起。如机器散热确实受限，可手动用 `--threads` 降低 LightGBM 线程数，或外部限制 CPU 频率。
 - **进度**：`python3 progress_ablation.py [ablation.log|ablation2.log]`（百分比/ETA）；`grep -aE "h=|完成" horizon.log | tail -5`；`grep -a 进度 extra.log|fundamental.log | tail -1`。
 - **监控脚本**：`bash watch_progress.sh [秒]`（下载/训练/GPU/温度同屏；注意 watch 外层用单引号）。
 - **swap**：`sudo bash setup_swap.sh`（新增 28G swap 文件凑满 32G，训练中可安全执行；vm.swappiness=20）。
