@@ -2,9 +2,13 @@ lgbm_output/
 ensemble_output/
 ablation_output/
 ablation_output_v1/
+ablation_output*/
+production_output/
+production/valid_predictions.csv.gz
 tcn_output/
 reports/
 stock_cache.db*
 *.log
+*.npy
 __pycache__/
 *.pyc

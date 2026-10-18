@@ -4,6 +4,11 @@ This report summarizes the results of the most recent backtest run (production o
 
 ## Summary Table
 
+**Information Coefficient (IC)**
+
+The underlying model's IC (Spearman correlation) for the production backtest is **0.0482** and IC/IR is **0.3819** (computed from `production_output/horizon_results.csv`).
+
+
 | Strategy | Days | Ann Gross | Ann Net | Sharpe | MDD | Win Daily | Avg Hold |
 |---|---|---|---|---|---|---|---|
 | Hold1Top5 | 665 | 11.7360 | 7.7569 | 5.6553 | -0.2474 | 0.6391 | 5.0 |
