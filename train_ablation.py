@@ -1337,10 +1337,10 @@ def main():
                     choices=["binary", "rankic"],
                     help="训练目标: binary=二分类(默认), rankic=LambdaRankIC"
                     "直接优化逐日Rank IC")
-    ap.add_argument("--label-type", default="binary",
+    ap.add_argument("--label-type", default="cross_binary",
                     choices=["binary", "cross_binary", "cross_rank"],
-                    help="标签类型: binary=R>0(默认), cross_binary=截面跑赢中位数, "
-                    "cross_rank=截面rank-gauss回归")
+                    help="标签类型: cross_binary=截面跑赢中位数(默认), "
+                    "binary=R>0(预测大盘+选股), cross_rank=截面rank-gauss回归")
     args = ap.parse_args()
 
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
