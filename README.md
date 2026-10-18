@@ -425,7 +425,7 @@ Platt/Isotonic 实验（2024 拟合 → 2025–2026 评估，223 万样本，`re
 | `lgbm_output/` | LGBM 基线：模型/重要度/回测汇总/逐日净值/分档/年AUC/**逐样本验证预测**（校准用） |
 | `ensemble_output/` | LGBM+TCN：三路评估与回测、融合权重扫描、逐样本预测 |
 | `ablation_output/` | 消融：`ablation_results.csv`（排序对比）、`ablation_importance.csv`、`horizon_results.csv`（+`config`列/分年度 `auc_年`/`ic_年`列/`holdP*`阈值持有列）、`holdbacktest_summary/daily.csv`（TopK + `Hold{h}P{thr}` 阈值策略）、`walkforward_results.csv` + `holdbacktest_wf_*`（walk-forward 窗口与 holdout）、`lgbm_all.txt`、`lgbm_h{h}[_all].txt`、`lhb_deepdive.md`、`lhb_monthly.csv`、`run_config.json` |
-| `production/` | **生产定稿**：`prod_h1/h5/h10_tech.txt`（三周期 tech 模型，见 §18）+ `features_tech.json`（40 特征名/列序） |
+| `production/` | **生产定稿**：`prod_h1/h5/h10_tech.txt`（三周期 tech 模型，见 §18）+ `features_tech.json`（40 特征名/列序）；`make_predictions.py` 生成 `valid_predictions.csv.gz`（2024-01 起全市场样本外 `date,code,prob_h1,prob_h5,prob_h10,prob`，`prob`=三模型等权平均，供 stock_predict `test` 档读取） |
 | `tcn_output/` | `tcn_results.csv`、`backtest_report.md`、`backtest_summary.csv` |
 | `reports/` | 清洗报告 / 校准评估 / 校准对比（日期命名） |
 
