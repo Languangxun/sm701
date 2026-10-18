@@ -54,9 +54,9 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 
 from lgbm_train_backtest import (COST, DATA_START, MIN_HOLD, SEED, TRAIN_END,
-                                 _aligned, ThermalCallback, asof_align,
-                                 build_features, daily_ic, load_bars, log,
-                                 neutralize_features, perf, run_period)
+                                 _aligned, asof_align, build_features, daily_ic,
+                                 load_bars, log, neutralize_features, perf,
+                                 run_period)
 from features_extra import (build_event_features, build_flow_features,
                             build_lhb_features, build_margin_features)
 
@@ -441,7 +441,8 @@ def compute_tradable_open(df):
         & (o < pc * (1.0 + lim - 0.005)), index=df.index)
 
 
-def build_multilabels(df, tradable, horizons=(1, 5, 10), exec_lag=1):
+def build_multilabels(df, tradable, horizons=(1, 5, 10), exec_lag=1,
+                      label_type="binary"):
     """多周期标签 (T+1执行, 无日内换仓)
 
     exec_lag=1 (默认): t收盘信号、t+1开盘买, R_h = close[t+h]/open[t+1]-1
@@ -451,7 +452,12 @@ def build_multilabels(df, tradable, horizons=(1, 5, 10), exec_lag=1):
         (见compute_tradable_open)
 
     mask_h: 入场可买(tradable, 与执行口径一致) 且持有窗内无>5天停牌
-            且i+h仍是同只股票. R为float32(NaN=无效), Y为R>0"""
+            且i+h仍是同一只股票. R为float32(NaN=无效)
+    label_type:
+        binary:      Y = R > 0 (默认二分类, 预测大盘+选股)
+        cross_binary:Y = 同日内R排名是否高于中位数 (截面二分类, 纯选股)
+        cross_rank:  Y = 同日内R排名的rank-gauss变换 (截面回归, 纯选股)
+    """
     n = len(df)
     o = df["open"].to_numpy(dtype=np.float64)
     c = df["close"].to_numpy(dtype=np.float64)
@@ -477,7 +483,25 @@ def build_multilabels(df, tradable, horizons=(1, 5, 10), exec_lag=1):
         m = np.zeros(n, dtype=bool)
         m[sel] = (cbad[sel + h] - cbad[sel] == 0)
         m &= np.isfinite(R) & entry
-        out[h] = (R.astype(np.float32), (R > 0).astype(np.int8), m)
+        if label_type == "binary":
+            Y = (R > 0).astype(np.int8)
+        elif label_type in ("cross_binary", "cross_rank"):
+            Y = np.full(n, np.nan, dtype=np.float64)
+            valid_idx = np.flatnonzero(m)
+            if len(valid_idx) > 0:
+                sub = pd.DataFrame(
+                    {"date": df["date"].values[valid_idx], "R": R[valid_idx]})
+                sub["rank"] = sub.groupby("date")["R"].rank(pct=True)
+                if label_type == "cross_binary":
+                    Y[valid_idx] = (sub["rank"].values > 0.5).astype(np.int8)
+                else:
+                    from scipy.stats import norm
+                    Y[valid_idx] = norm.ppf(
+                        np.clip(sub["rank"].values, 1e-3, 1 - 1e-3))
+            Y = Y.astype(np.float32)
+        else:
+            raise ValueError(f"未知 label_type: {label_type}")
+        out[h] = (R.astype(np.float32), Y, m)
     return out
 
 
@@ -741,7 +765,7 @@ def run_hold_threshold_backtest(dates_all, codes_all, mask_rows, prob,
             else pd.DataFrame())
 
 
-def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
+def run_horizon_mode(args, params, groups, names, labels,
                      warm, year, dates, codes, nr_all, bars_oc, t0,
                      regime=None, bars_amt=None, liquidity=None):
     """多周期模式: 每个horizon独立训练一个二分类模型(特征=全部请求组)
@@ -828,17 +852,22 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
             gc.collect()
             train_kw = {"params": params, "train_set": dtr,
                         "num_boost_round": args.rounds, "valid_sets": [dva]}
+            label_type = getattr(args, "label_type", "binary")
             if rankic_mode:
-                from rank_ic_objective import (make_lambdarank_ic_objective,
-                                               make_rank_auc_eval,
+                from rank_ic_objective import (make_auc_eval, make_lambdarank_ic_objective,
+                                               make_mse_eval,
                                                make_rank_ic_eval)
                 p = dict(params)
                 p["objective"] = make_lambdarank_ic_objective(
-                    R[tr_h], dates[tr_h])
+                    R[tr_h], dates[tr_h], weights=w_h)
                 p["metric"] = "None"
                 train_kw["params"] = p
-                train_kw["feval"] = [make_rank_ic_eval(R[va_h], dates[va_h]),
-                                     make_rank_auc_eval(yv[va_h])]
+                feval_list = [make_rank_ic_eval(R[va_h], dates[va_h])]
+                if label_type in ("binary", "cross_binary"):
+                    feval_list.append(make_auc_eval(yv[va_h]))
+                else:
+                    feval_list.append(make_mse_eval(yv[va_h]))
+                train_kw["feval"] = feval_list
             model = lgb.train(
                 **train_kw,
                 callbacks=[lgb.early_stopping(150, first_metric_only=True,
@@ -847,7 +876,7 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
                            lgb.log_evaluation(200)])
             Xva = build_config(names, cfg, va_h)
             p_raw = model.predict(Xva, num_iteration=model.best_iteration)
-            if rankic_mode:
+            if rankic_mode and label_type in ("binary", "cross_binary"):
                 p_raw = 1.0 / (1.0 + np.exp(-np.clip(p_raw, -50, 50)))
             del Xva
             gc.collect()
@@ -990,7 +1019,7 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
     log(f"全部完成, 总用时 {(time.time() - t0) / 60:.1f} min")
 
 
-def run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
+def run_walkforward_mode(args, params, groups, names, labels,
                          warm, year, dates, codes, nr_all, bars_oc, t0,
                          regime=None, bars_amt=None, liquidity=None):
     """walk-forward 多窗口 + holdout 定稿评估.
@@ -1035,26 +1064,31 @@ def run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
         gc.collect()
         train_kw = {"params": params, "train_set": dtr,
                     "num_boost_round": args.rounds, "valid_sets": [dva]}
+        label_type = getattr(args, "label_type", "binary")
         if rankic_mode:
-            from rank_ic_objective import (make_lambdarank_ic_objective,
-                                           make_rank_auc_eval,
+            from rank_ic_objective import (make_auc_eval, make_lambdarank_ic_objective,
+                                           make_mse_eval,
                                            make_rank_ic_eval)
             p = dict(params)
             p["objective"] = make_lambdarank_ic_objective(
-                R[tr_idx], dates[tr_idx])
+                R[tr_idx], dates[tr_idx], weights=w)
             p["metric"] = "None"
             train_kw["params"] = p
-            train_kw["feval"] = [make_rank_ic_eval(R[va_idx], dates[va_idx]),
-                                 make_rank_auc_eval(yv[va_idx])]
+            feval_list = [make_rank_ic_eval(R[va_idx], dates[va_idx])]
+            if label_type in ("binary", "cross_binary"):
+                feval_list.append(make_auc_eval(yv[va_idx]))
+            else:
+                feval_list.append(make_mse_eval(yv[va_idx]))
+            train_kw["feval"] = feval_list
         model = lgb.train(
             **train_kw,
             callbacks=[lgb.early_stopping(150, first_metric_only=True,
                                           verbose=False),
-                       thermal_cb,
                        lgb.log_evaluation(200)])
         Xva = build_config(names, allg, va_idx)
         p_raw = model.predict(Xva, num_iteration=model.best_iteration)
-        if rankic_mode:
+        if rankic_mode and label_type in ("binary", "cross_binary"):
+            # 自定义目标输出 raw margin, 二分类标签需 sigmoid 为概率
             p_raw = 1.0 / (1.0 + np.exp(-np.clip(p_raw, -50, 50)))
         del Xva
         gc.collect()
@@ -1239,12 +1273,6 @@ def main():
     ap.add_argument("--leaves", type=int, default=31)
     ap.add_argument("--lr", type=float, default=0.03)
     ap.add_argument("--threads", type=int, default=6, help="LightGBM线程数")
-    ap.add_argument("--throttle", type=float, default=0.0,
-                    help="每轮提升后休眠秒数, 降低发热")
-    ap.add_argument("--temp-limit", type=float, default=92.0,
-                    help="CPU温度超过该值自动挂起降温")
-    ap.add_argument("--temp-resume", type=float, default=85.0,
-                    help="降温到该值以下继续")
     ap.add_argument("--train-sample", type=int, default=0,
                     help="训练采样行数, 0=全量(默认)")
     ap.add_argument("--valid-sample", type=int, default=0,
@@ -1309,6 +1337,10 @@ def main():
                     choices=["binary", "rankic"],
                     help="训练目标: binary=二分类(默认), rankic=LambdaRankIC"
                     "直接优化逐日Rank IC")
+    ap.add_argument("--label-type", default="binary",
+                    choices=["binary", "cross_binary", "cross_rank"],
+                    help="标签类型: binary=R>0(默认), cross_binary=截面跑赢中位数, "
+                    "cross_rank=截面rank-gauss回归")
     args = ap.parse_args()
 
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
@@ -1447,10 +1479,12 @@ def main():
         if args.exec == "topen":
             log("执行口径: 盘中信号锚定开盘价 (信号日=买入日, open[t]执行)")
             labels = build_multilabels(df, compute_tradable_open(df),
-                                       tuple(horizons), exec_lag=0)
+                                       tuple(horizons), exec_lag=0,
+                                       label_type=args.label_type)
         else:
             labels = build_multilabels(df, tradable, tuple(horizons),
-                                       exec_lag=1)
+                                       exec_lag=1,
+                                       label_type=args.label_type)
         log(f"多周期标签: {sorted(labels)}")
         for h, (R, Y, M) in labels.items():
             log(f"  h={h}: 训练 {(M & (year <= int(TRAIN_END[:4])).values).sum():,} / "
@@ -1542,8 +1576,17 @@ def main():
             tr_idx, size=args.train_auc_sample, replace=False))
 
     rankic_mode = args.objective == "rankic"
+    label_type = getattr(args, "label_type", "binary")
+    if label_type == "binary":
+        obj, metric = "binary", ["auc", "binary_logloss"]
+    elif label_type == "cross_binary":
+        obj, metric = "binary", ["auc", "binary_logloss"]
+    elif label_type == "cross_rank":
+        obj, metric = "regression", ["l2", "l1"]
+    else:
+        raise ValueError(f"未知 label_type: {label_type}")
     params = {
-        "objective": "binary", "metric": ["auc", "binary_logloss"],
+        "objective": obj, "metric": metric,
         "learning_rate": args.lr, "num_leaves": args.leaves,
         "min_data_in_leaf": 1000, "feature_fraction": 0.6,
         "bagging_fraction": 0.7, "bagging_freq": 1, "lambda_l2": 20.0,
@@ -1552,21 +1595,19 @@ def main():
         "bagging_seed": args.seed,
     }
     if rankic_mode:
-        params["objective"] = "binary"  # placeholder, 实际在训练时替换为函数
+        params["objective"] = obj  # placeholder, 训练时替换为自定义函数
         params["metric"] = "None"
-        log("训练目标: rankic (LambdaRankIC 直接优化逐日Rank IC)")
-    thermal_cb = ThermalCallback(limit=args.temp_limit,
-                                 resume=args.temp_resume,
-                                 throttle=args.throttle, every=5)
-
+        log(f"训练目标: rankic (LambdaRankIC), 标签类型: {label_type}")
+    else:
+        log(f"标签类型: {label_type}, objective: {obj}")
     if args.mode == "horizon":
-        run_horizon_mode(args, params, thermal_cb, groups, names, labels,
+        run_horizon_mode(args, params, groups, names, labels,
                          warm, year, dates, codes, nr_all, bars_oc, t0,
                          regime=regime, bars_amt=bars_amt,
                          liquidity=liquidity)
         return
     if args.mode == "walkforward":
-        run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
+        run_walkforward_mode(args, params, groups, names, labels,
                              warm, year, dates, codes, nr_all, bars_oc, t0,
                              regime=regime, bars_amt=bars_amt,
                              liquidity=liquidity)
@@ -1593,7 +1634,6 @@ def main():
             params, dtr, num_boost_round=args.rounds, valid_sets=[dva],
             callbacks=[lgb.early_stopping(150, first_metric_only=True,
                                           verbose=False),
-                       thermal_cb,
                        lgb.log_evaluation(200)])
         Xva = build_config(names, cfg, va_idx)
         p_va = model.predict(Xva, num_iteration=model.best_iteration)

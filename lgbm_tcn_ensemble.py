@@ -200,8 +200,6 @@ def train_tcn(args, vals, start, tr_idx, va_idx, y_all, w_all, n_feat, device,
             xb, _, _ = make_batch(idx[i:i + batch])
             out[i:i + batch] = torch.sigmoid(
                 model(xb.to(device))).float().cpu().numpy()
-            if args.throttle > 0:
-                time.sleep(args.throttle)
         return out
 
     best_auc, best_state, bad, hist = -1.0, None, 0, []
@@ -248,8 +246,6 @@ def train_tcn(args, vals, start, tr_idx, va_idx, y_all, w_all, n_feat, device,
             if args.clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), args.clip)
             opt.step()
-            if args.throttle > 0:
-                time.sleep(args.throttle)
             run_loss += loss.item() * len(rows)
             seen += len(rows)
             if step % 500 == 0:
@@ -305,8 +301,6 @@ def main():
     ap.add_argument("--train-stride", type=int, default=1,
                     help="训练样本抽稀步长, >1 加速训练")
     ap.add_argument("--max-train", type=int, default=0, help="训练样本上限")
-    ap.add_argument("--throttle", type=float, default=0.0,
-                    help="每步训练后休眠秒数, 降低GPU占空比/发热, 如 0.05")
     ap.add_argument("--tcn-weight", type=float, default=0.5)
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     ap.add_argument("--resume", action="store_true",

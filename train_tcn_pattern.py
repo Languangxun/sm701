@@ -26,8 +26,7 @@ import lightgbm as lgb
 from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 
 from lgbm_train_backtest import (DATA_START, SEED, TRAIN_END,
-                                 ThermalCallback, build_features, load_bars,
-                                 log, run_period, thermal_wait)
+                                 build_features, load_bars, log, run_period)
 from lgbm_tcn_ensemble import (TCN, make_batch_fn, pair_lists, parse_ints,
                                standardize, stock_start_idx)
 from train_ablation import MKT_COLS, build_pattern_features, to_matrix
@@ -77,11 +76,7 @@ def train_tcn(args, vals, start, tr_idx, va_idx, y_all, w_all, n_feat, device):
             opt.step()
             run_loss += loss.item() * len(rows)
             seen += len(rows)
-            if args.throttle > 0:
-                time.sleep(args.throttle)
             step = i // args.batch_size
-            if step % 20 == 0:
-                thermal_wait(args.temp_limit, args.temp_resume)
             if step % args.log_every == 0 or step == n_steps - 1:
                 log(f"    epoch {ep} step {step}/{n_steps} "
                     f"loss {run_loss / max(seen, 1):.5f} "
@@ -151,10 +146,6 @@ def main():
     ap.add_argument("--rounds", type=int, default=1500)
     ap.add_argument("--threads", type=int, default=4,
                     help="CPU线程数(LGBM/张量准备)")
-    ap.add_argument("--throttle", type=float, default=0.05,
-                    help="每批训练后休眠秒数, 降低发热")
-    ap.add_argument("--temp-limit", type=float, default=92.0)
-    ap.add_argument("--temp-resume", type=float, default=85.0)
     ap.add_argument("--log-every", type=int, default=200,
                     help="每N批打印一次进度")
     ap.add_argument("--no-parallel", action="store_true",
@@ -224,10 +215,6 @@ def main():
         "lambda_l2": 20.0, "max_bin": 127, "num_threads": args.threads,
         "verbosity": -1, "seed": args.seed,
     }
-    thermal_cb = ThermalCallback(limit=args.temp_limit,
-                                 resume=args.temp_resume,
-                                 throttle=0.0, every=5)
-
     rows, sums = [], []
     configs = [c.strip() for c in args.configs.split(",") if c.strip()]
     for cfg in configs:
@@ -250,8 +237,7 @@ def main():
             lgbm = lgb.train(params, dtr, num_boost_round=args.rounds,
                              valid_sets=[dva],
                              callbacks=[lgb.early_stopping(
-                                 150, first_metric_only=True, verbose=False),
-                                 thermal_cb])
+                                 150, first_metric_only=True, verbose=False)])
             lgbm_box["pl"] = lgbm.predict(
                 vals[va_idx], num_iteration=lgbm.best_iteration)
             lgbm_box["iter"] = lgbm.best_iteration
