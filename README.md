@@ -448,9 +448,9 @@ Platt/Isotonic 实验（2024 拟合 → 2025–2026 评估，223 万样本，`re
 
 | 周期 | 模型 | 验证 AUC / IC | best_iter |
 |---|---|---|---|
-| T+1 | `production/prod_h1_tech.txt` | 0.5440 / 0.0145 | 1566 |
-| T+5 | `production/prod_h5_tech.txt` | 0.5560 / 0.0461 | 1998 |
-| T+10 | `production/prod_h10_tech.txt` | 0.5645 / 0.0665 | 1600 |
+| T+1 | `production/prod_h1_tech.txt` | 0.5440 / 0.0482 | 1566 |
+| T+5 | `production/prod_h5_tech.txt` | 0.5560 / 0.1079 | 1998 |
+| T+10 | `production/prod_h10_tech.txt` | 0.5645 / 0.1270 | 1600 |
 
 - 输入：tech 40 特征（定义 §5.1），**列序以 `production/features_tech.json` 为准**，float32、缺失填 NaN；特征口径与 `lgbm_train_backtest._compute_feats` 完全一致（t 及以前、横截面排名限当日）。
 - 推理：
