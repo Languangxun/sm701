@@ -56,7 +56,7 @@ from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 from lgbm_train_backtest import (COST, DATA_START, MIN_HOLD, SEED, TRAIN_END,
                                  _aligned, ThermalCallback, asof_align,
                                  build_features, daily_ic, load_bars, log,
-                                 perf, run_period)
+                                 neutralize_features, perf, run_period)
 from features_extra import (build_event_features, build_flow_features,
                             build_lhb_features, build_margin_features)
 
@@ -65,7 +65,7 @@ DB = os.path.join(HERE, "stock_cache.db")
 OUT_DIR = os.path.join(HERE, "ablation_output")
 
 GROUPS = ["tech", "pattern", "market", "industry", "fund",
-          "flow", "margin", "lhb", "events"]
+          "flow", "margin", "lhb", "events", "tech_norm", "pattern_norm"]
 # market 组是每日常数特征(同一天所有股票值相同), 混入横截面选股模型会占据
 # 早期分裂、日内预测趋同、TopK退化——默认不进选股, 仅择时研究时手动指定
 DEFAULT_GROUPS = "tech,pattern,industry,fund"
@@ -752,6 +752,7 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
     回测与阈值重搜都用校准后概率; regime/max_dd 作用于重叠持仓回测"""
     allg = tuple(groups)
     horizons = sorted(labels)
+    rankic_mode = args.objective == "rankic"
     log(f"horizon模式: 周期 {horizons}, 特征组 {list(allg)}")
     cfgs = []
     if args.per_group:
@@ -825,14 +826,29 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
             dva = lgb.Dataset(Xva, label=yv[va_h], reference=dtr)
             del Xva
             gc.collect()
+            train_kw = {"params": params, "train_set": dtr,
+                        "num_boost_round": args.rounds, "valid_sets": [dva]}
+            if rankic_mode:
+                from rank_ic_objective import (make_lambdarank_ic_objective,
+                                               make_rank_auc_eval,
+                                               make_rank_ic_eval)
+                p = dict(params)
+                p["objective"] = make_lambdarank_ic_objective(
+                    R[tr_h], dates[tr_h])
+                p["metric"] = "None"
+                train_kw["params"] = p
+                train_kw["feval"] = [make_rank_ic_eval(R[va_h], dates[va_h]),
+                                     make_rank_auc_eval(yv[va_h])]
             model = lgb.train(
-                params, dtr, num_boost_round=args.rounds, valid_sets=[dva],
+                **train_kw,
                 callbacks=[lgb.early_stopping(150, first_metric_only=True,
                                               verbose=False),
                            thermal_cb,
                            lgb.log_evaluation(200)])
             Xva = build_config(names, cfg, va_h)
             p_raw = model.predict(Xva, num_iteration=model.best_iteration)
+            if rankic_mode:
+                p_raw = 1.0 / (1.0 + np.exp(-np.clip(p_raw, -50, 50)))
             del Xva
             gc.collect()
             p_va = p_raw
@@ -841,6 +857,8 @@ def run_horizon_mode(args, params, thermal_cb, groups, names, labels,
                 Xc = build_config(names, cfg, cal_h)
                 p_cal = model.predict(Xc,
                                       num_iteration=model.best_iteration)
+                if rankic_mode:
+                    p_cal = 1.0 / (1.0 + np.exp(-np.clip(p_cal, -50, 50)))
                 del Xc
                 gc.collect()
                 lr = fit_platt(p_cal, yv[cal_h])
@@ -982,6 +1000,7 @@ def run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
     --calibrate platt 时最终模型改用 2018~(CY-1)训练 / CY年校准 / 评估."""
     allg = tuple(groups)
     horizons = sorted(labels)
+    rankic_mode = args.objective == "rankic"
     vy_list = [int(v) for v in args.wf_valid_years.split(",") if v.strip()]
     log(f"walk-forward: 验证年 {vy_list}, 周期 {horizons}, "
         f"特征组 {list(allg)}")
@@ -1014,14 +1033,29 @@ def run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
         dva = lgb.Dataset(Xva, label=yv[va_idx], reference=dtr)
         del Xva
         gc.collect()
+        train_kw = {"params": params, "train_set": dtr,
+                    "num_boost_round": args.rounds, "valid_sets": [dva]}
+        if rankic_mode:
+            from rank_ic_objective import (make_lambdarank_ic_objective,
+                                           make_rank_auc_eval,
+                                           make_rank_ic_eval)
+            p = dict(params)
+            p["objective"] = make_lambdarank_ic_objective(
+                R[tr_idx], dates[tr_idx])
+            p["metric"] = "None"
+            train_kw["params"] = p
+            train_kw["feval"] = [make_rank_ic_eval(R[va_idx], dates[va_idx]),
+                                 make_rank_auc_eval(yv[va_idx])]
         model = lgb.train(
-            params, dtr, num_boost_round=args.rounds, valid_sets=[dva],
+            **train_kw,
             callbacks=[lgb.early_stopping(150, first_metric_only=True,
                                           verbose=False),
                        thermal_cb,
                        lgb.log_evaluation(200)])
         Xva = build_config(names, allg, va_idx)
         p_raw = model.predict(Xva, num_iteration=model.best_iteration)
+        if rankic_mode:
+            p_raw = 1.0 / (1.0 + np.exp(-np.clip(p_raw, -50, 50)))
         del Xva
         gc.collect()
         p_va = p_raw
@@ -1029,6 +1063,8 @@ def run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
         if cal_idx is not None and len(cal_idx):
             Xc = build_config(names, allg, cal_idx)
             p_cal = model.predict(Xc, num_iteration=model.best_iteration)
+            if rankic_mode:
+                p_cal = 1.0 / (1.0 + np.exp(-np.clip(p_cal, -50, 50)))
             del Xc
             gc.collect()
             lr = fit_platt(p_cal, yv[cal_idx])
@@ -1185,6 +1221,7 @@ def run_walkforward_mode(args, params, thermal_cb, groups, names, labels,
 
 
 def main():
+    global OUT_DIR
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="随机抽取N只股票(冒烟)")
     ap.add_argument("--seed", type=int, default=SEED)
@@ -1223,6 +1260,14 @@ def main():
                     "树模型不需要标准化, cross会洗掉全市场估值水位本身的"
                     "牛熊信息); cross=当日z-score, industry=行业中性化后"
                     "z-score (只用t日横截面, PIT安全)")
+    ap.add_argument("--tech-norm", default="none",
+                    choices=["none", "cross", "industry"],
+                    help="技术指标tech组横截面处理: none=原始值(默认), "
+                    "cross=当日z-score, industry=行业中性化后z-score")
+    ap.add_argument("--pattern-norm", default="none",
+                    choices=["none", "cross", "industry"],
+                    help="K线形态pattern组横截面处理: none=原始值(默认), "
+                    "cross=当日z-score, industry=行业中性化后z-score")
     ap.add_argument("--calibrate", default="none",
                     choices=["none", "platt"],
                     help="Platt校准: 2018~(CY-1)训练/CY年校准/(CY+1)~评估, "
@@ -1258,9 +1303,32 @@ def main():
                     "(R=close[t+h]/open[t+1]-1); topen=盘中信号锚定开盘价, "
                     "信号日=买入日/open[t]执行 (R=close[t+h]/open[t]-1), "
                     "仅horizon/walkforward可用")
+    ap.add_argument("--out-dir", default=OUT_DIR,
+                    help="输出目录, 默认 ablation_output")
+    ap.add_argument("--objective", default="binary",
+                    choices=["binary", "rankic"],
+                    help="训练目标: binary=二分类(默认), rankic=LambdaRankIC"
+                    "直接优化逐日Rank IC")
     args = ap.parse_args()
 
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
+    # 若用户显式指定 tech_norm/pattern_norm, 自动开启对应 norm 参数
+    if "tech_norm" in groups and args.tech_norm == "none":
+        args.tech_norm = "cross"
+    if "pattern_norm" in groups and args.pattern_norm == "none":
+        args.pattern_norm = "cross"
+    # tech/pattern 若指定了 norm, 内部实际使用 tech_norm/pattern_norm 文件
+    if args.tech_norm != "none":
+        groups = ["tech_norm" if g == "tech" else g for g in groups]
+    if args.pattern_norm != "none":
+        groups = ["pattern_norm" if g == "pattern" else g for g in groups]
+    # 去重并保持顺序
+    seen, dedup = set(), []
+    for g in groups:
+        if g not in seen:
+            seen.add(g)
+            dedup.append(g)
+    groups = dedup
     for g in groups:
         if g not in GROUPS:
             raise SystemExit(f"未知特征组 {g}, 可选: {', '.join(GROUPS)}")
@@ -1270,6 +1338,7 @@ def main():
         log("警告: market 组是每日常数特征, 选股模型应剔除(见README §5.3/§11); "
             "仅大盘择时研究时保留, 回测出现恒定预测/固定篮子即退化信号")
 
+    OUT_DIR = args.out_dir
     os.makedirs(OUT_DIR, exist_ok=True)
     t0 = time.time()
 
@@ -1317,6 +1386,16 @@ def main():
 
     tech_cols = [c for c in X.columns if c not in MKT_COLS]
     put("tech", to_matrix(X, tech_cols), tech_cols)
+    if args.tech_norm != "none":
+        log(f"tech 组横截面处理: {args.tech_norm} ...")
+        ind_map = (load_industry_map()
+                   if args.tech_norm == "industry" else None)
+        tech_norm_mat = neutralize_features(
+            to_matrix(X, tech_cols), dates, codes,
+            ind_map=ind_map, mode=args.tech_norm)
+        put("tech_norm", tech_norm_mat, [f"{c}_n" for c in tech_cols])
+        del tech_norm_mat
+        gc.collect()
     mkt_base = to_matrix(X, MKT_COLS)
     warm = ((year >= int(DATA_START[:4])) & X["ret60"].notna()).values
     regime = None
@@ -1329,9 +1408,20 @@ def main():
     del X
     gc.collect()
 
-    if "pattern" in groups:
+    if "pattern" in groups or "pattern_norm" in groups:
         pat = build_pattern_features(df)
         put("pattern", to_matrix(pat), list(pat.columns))
+        if args.pattern_norm != "none":
+            log(f"pattern 组横截面处理: {args.pattern_norm} ...")
+            ind_map = (load_industry_map()
+                       if args.pattern_norm == "industry" else None)
+            pat_norm_mat = neutralize_features(
+                to_matrix(pat), dates, codes,
+                ind_map=ind_map, mode=args.pattern_norm)
+            put("pattern_norm", pat_norm_mat,
+                [f"{c}_n" for c in pat.columns])
+            del pat_norm_mat
+            gc.collect()
         del pat
         gc.collect()
 
@@ -1451,6 +1541,7 @@ def main():
         tr_sub = np.sort(np.random.RandomState(args.seed + 1).choice(
             tr_idx, size=args.train_auc_sample, replace=False))
 
+    rankic_mode = args.objective == "rankic"
     params = {
         "objective": "binary", "metric": ["auc", "binary_logloss"],
         "learning_rate": args.lr, "num_leaves": args.leaves,
@@ -1460,6 +1551,10 @@ def main():
         "seed": args.seed, "feature_fraction_seed": args.seed,
         "bagging_seed": args.seed,
     }
+    if rankic_mode:
+        params["objective"] = "binary"  # placeholder, 实际在训练时替换为函数
+        params["metric"] = "None"
+        log("训练目标: rankic (LambdaRankIC 直接优化逐日Rank IC)")
     thermal_cb = ThermalCallback(limit=args.temp_limit,
                                  resume=args.temp_resume,
                                  throttle=args.throttle, every=5)

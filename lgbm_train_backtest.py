@@ -124,6 +124,60 @@ def asof_align(left_codes, left_dates, right, right_date_col="date",
     return out
 
 
+def neutralize_features(mat, dates, codes, ind_map=None, mode="cross",
+                        clip=5.0, min_n=10):
+    """截面标准化 / 行业中性化 (PIT安全: 只用 t 日当天的横截面)
+
+    - cross:    z = (x - 当日均值) / 当日标准差, 再 clip ±clip
+    - industry: 先减行业内均值(无映射行用全市场均值), 再除以当日标准差, clip ±clip
+    - none:     原样返回
+    NaN 保留(不填充, 交给 LightGBM); 日内有效样本 <min_n 或标准差 ~0 的列跳过。
+    """
+    if mode == "none":
+        return mat
+    out = np.array(mat, dtype=np.float32, copy=True)
+    dates_a = np.asarray(dates)
+    order = np.argsort(dates_a, kind="stable")
+    sd = dates_a[order]
+    uniq, cnts = np.unique(sd, return_counts=True)
+    ind_arr = None
+    if mode == "industry":
+        ind_arr = np.array(
+            [ind_map.get(str(c), "") if ind_map else "" for c in
+             np.asarray(codes)], dtype=object)
+    pos = 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for _, c in zip(uniq, cnts):
+            rows = order[pos:pos + c]
+            pos += c
+            b = out[rows].astype(np.float64)
+            n = (~np.isnan(b)).sum(axis=0)
+            mu = np.nanmean(b, axis=0)
+            sd_ = np.nanstd(b, axis=0)
+            if mode == "industry" and ind_arr is not None:
+                gi = ind_arr[rows]
+                for ind in np.unique(gi):
+                    m = gi == ind
+                    if m.sum() < 2:
+                        continue
+                    sub = b[m]
+                    gm = np.nanmean(sub, axis=0)
+                    use = ~np.isnan(gm)
+                    sub[:, use] -= gm[use]
+                    b[m] = sub
+            else:
+                good = (n >= min_n) & np.isfinite(mu)
+                b[:, good] -= mu[good]
+            good = ((n >= min_n) & np.isfinite(sd_) & (sd_ > 1e-12))
+            if good.any():
+                b[:, good] /= sd_[good]
+                if clip is not None and clip > 0:
+                    np.clip(b[:, good], -clip, clip, out=b[:, good])
+            out[rows] = b.astype(np.float32)
+    return out
+
+
 class ThermalCallback:
     """LightGBM 每轮回调: 节流休眠 + 温度超限自动挂起"""
 
