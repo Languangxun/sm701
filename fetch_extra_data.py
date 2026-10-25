@@ -61,8 +61,8 @@ MARGIN_SSE = {
 }
 MARGIN_SZSE = {
     "证券代码": "raw_code", "证券简称": "name", "融资买入额": "rz_buy",
-    "融资余额": "rz_bal", "融券卖出量": "rq_sell", "融券余量": "rq_vol",
-    "融券余额": "rq_bal", "融资融券余额": "total_bal",
+    "融资余额": "rz_bal", "融资偿还额": "rz_repay", "融券卖出量": "rq_sell",
+    "融券余量": "rq_vol", "融券余额": "rq_bal", "融资融券余额": "total_bal",
 }
 BOND_RENAME = {
     "日期": "date", "中国国债收益率2年": "cn_2y", "中国国债收益率5年": "cn_5y",

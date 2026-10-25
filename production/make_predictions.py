@@ -4,17 +4,20 @@
 
 读取 `production/features_tech.json`（40 特征名/列序）与
 `production/prod_h{1,5,10}_tech.txt`，用与训练完全一致的
-`lgbm_train_backtest._compute_feats` 计算特征，对 `--start` 之后的全部
-(code, date) 输出三周期概率及其等权平均：
+`lgbm_train_backtest._compute_feats` 计算特征，输出 `--out-start`
+（默认 2024-01-01）之后的全部 (code, date) 三周期概率及其等权平均：
 
     date,code,prob_h1,prob_h5,prob_h10,prob
+
+`--start`（默认 2022-06-01）仅为特征预热起点，需早于 `--out-start`
+至少 60 个交易日以填充 ret60/ma60。
 
 供 stock_predict 的 `test` 档（sm701 直出）历史段流式读取；等权平均即
 test 档分数口径（与 `_sm701_live_predict` 实时复算一致）。
 
 用法:
-    python3 production/make_predictions.py                 # 2024-01-01 起
-    python3 production/make_predictions.py --start 2023-01-01
+    python3 production/make_predictions.py                 # 输出 2024-01-01 起
+    python3 production/make_predictions.py --out-start 2023-01-01
 """
 import argparse
 import gc

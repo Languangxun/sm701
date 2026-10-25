@@ -26,12 +26,14 @@ import numpy as np
 
 
 def _prepare(ret, dates, weights=None):
-    """按日期排序, 返回排序后的 ret/dates/weights 及分组边界"""
+    """按日期排序, 返回排序后的 ret/dates/weights 及分组边界
+
+    第 5 个返回值是排序置换 `order` (order[i] = 排序后第 i 行在原数组中的下标).
+    调用方须用 `arr[order]` 把预测/权重对齐到 sorted 顺序, 用 `out[order] = x`
+    把 sorted 顺序的结果散射回原顺序."""
     ret = np.asarray(ret, dtype=np.float64)
     dates = np.asarray(dates)
     order = np.argsort(dates, kind="stable")
-    inv_order = np.empty(len(order), dtype=np.int64)
-    inv_order[order] = np.arange(len(order))
     ret_s = ret[order]
     dates_s = dates[order]
     weights_s = (np.ones_like(ret_s) if weights is None
@@ -40,7 +42,7 @@ def _prepare(ret, dates, weights=None):
     ends = np.cumsum(counts)
     starts = np.concatenate([[0], ends[:-1]])
     groups = list(zip(starts, ends))
-    return ret_s, dates_s, weights_s, groups, inv_order
+    return ret_s, dates_s, weights_s, groups, order
 
 
 def _day_grad(p, r, w, max_pairs=64, seed=0):
@@ -93,9 +95,9 @@ def _day_grad(p, r, w, max_pairs=64, seed=0):
 def _lambdarank_ic_grad(preds, ret, dates, weights=None,
                         max_pairs_per_day=64, eps=1e-12, seed=42):
     """核心梯度计算"""
-    ret_s, dates_s, weights_s, groups, inv_order = _prepare(
+    ret_s, dates_s, weights_s, groups, order = _prepare(
         ret, dates, weights)
-    preds_s = np.asarray(preds, dtype=np.float64)[inv_order]
+    preds_s = np.asarray(preds, dtype=np.float64)[order]
     grad_s = np.zeros_like(preds_s, dtype=np.float64)
     hess_s = np.zeros_like(preds_s, dtype=np.float64)
 
@@ -111,8 +113,8 @@ def _lambdarank_ic_grad(preds, ret, dates, weights=None,
 
     grad = np.empty_like(preds_s)
     hess = np.empty_like(preds_s)
-    grad[inv_order] = grad_s
-    hess[inv_order] = hess_s
+    grad[order] = grad_s
+    hess[order] = hess_s
 
     # 数值稳定
     grad = np.clip(grad, -50, 50)
@@ -122,18 +124,25 @@ def _lambdarank_ic_grad(preds, ret, dates, weights=None,
 
 def make_lambdarank_ic_objective(ret, dates, weights=None,
                                  max_pairs_per_day=64, seed=42):
-    """返回 LightGBM 自定义目标函数"""
+    """返回 LightGBM 自定义目标函数
+
+    每次调用(每个 boosting 迭代)用不同随机种子重采样配对, 避免所有迭代
+    反复使用同一批固定配对导致梯度方差过大/信号受限."""
+    state = {"n": 0}
+
     def objective(preds, train_data):
+        state["n"] += 1
         return _lambdarank_ic_grad(
             preds, ret, dates, weights=weights,
-            max_pairs_per_day=max_pairs_per_day, seed=seed)
+            max_pairs_per_day=max_pairs_per_day,
+            seed=seed + state["n"] * 100003)
     return objective
 
 
 def _rank_ic(preds, ret, dates):
     """逐日 Rank IC (Spearman)"""
-    ret_s, dates_s, _, groups, inv_order = _prepare(ret, dates)
-    preds_s = np.asarray(preds, dtype=np.float64)[inv_order]
+    ret_s, dates_s, _, groups, order = _prepare(ret, dates)
+    preds_s = np.asarray(preds, dtype=np.float64)[order]
     ic_vals = []
     for s, e in groups:
         if e - s < 50:

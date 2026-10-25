@@ -77,11 +77,19 @@ def build_margin_features(dates, codes):
     df = df.sort_values(["code", "date"]).reset_index(drop=True)
     gc = df["code"]
     rz, rq = df["rz_bal"], df["rq_bal"]
+    rz_buy = df["rz_buy"]
+    # 深交所接口不提供"融资偿还额", 用余额恒等式补齐:
+    # rz_bal[t] = rz_bal[t-1] + rz_buy[t] - rz_repay[t]
+    rz_repay = df["rz_repay"]
+    if rz_repay.isna().any():
+        prev_bal = rz.groupby(gc, sort=False).shift(1)
+        rz_repay = rz_repay.where(
+            rz_repay.notna(), prev_bal + rz_buy - rz)
     F = pd.DataFrame({
         "mg_rz_chg1": rz / rz.groupby(gc, sort=False).shift(1) - 1,
         "mg_rz_chg5": rz / rz.groupby(gc, sort=False).shift(5) - 1,
         "mg_rz_chg20": rz / rz.groupby(gc, sort=False).shift(20) - 1,
-        "mg_buy_ratio": df["rz_buy"] / (df["rz_buy"] + df["rz_repay"] + 1e-9),
+        "mg_buy_ratio": rz_buy / (rz_buy + rz_repay + 1e-9),
         "mg_rq_chg5": rq / rq.groupby(gc, sort=False).shift(5) - 1,
         "mg_log_rz": np.log(rz.clip(lower=1.0)),
     }).astype(np.float32)
@@ -123,8 +131,6 @@ def build_lhb_features(dates, codes):
              "lhb_hsl28", "lhb_nolim28", "lhb_cnt84", "lhb_net84"]
     n = len(names)
     out = np.zeros((len(dates), n), dtype=np.float32)
-    sums = {c: np.cumsum(agg[c].to_numpy(dtype=np.float64)) for c in vcols}
-    sums["__cnt"] = np.cumsum(agg["cnt"].to_numpy(dtype=np.float64))
 
     def seg(cum, j_hi, j_lo):
         return cum[j_hi - 1] - np.where(j_lo > 0, cum[j_lo - 1], 0.0)
@@ -134,8 +140,10 @@ def build_lhb_features(dates, codes):
         if rows is None:
             continue
         d = g["day"].to_numpy()
-        gi = g.index.to_numpy()
         t = ld[rows]
+        # 每股单独做前缀和, 避免用组内下标去索引全局 cumsum 导致串码
+        sums = {c: np.cumsum(g[c].to_numpy(dtype=np.float64)) for c in vcols}
+        sums["__cnt"] = np.cumsum(g["cnt"].to_numpy(dtype=np.float64))
         j_hi = np.searchsorted(d, t, side="left")
         j_lo = np.searchsorted(d, t - 28, side="left")
         ok = j_hi > 0

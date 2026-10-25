@@ -1488,6 +1488,12 @@ def main():
         for h, (R, Y, M) in labels.items():
             log(f"  h={h}: 训练 {(M & (year <= int(TRAIN_END[:4])).values).sum():,} / "
                 f"验证 {(M & ~(year <= int(TRAIN_END[:4])).values).sum():,}")
+    else:
+        # 普通消融模式也按 --label-type 构造 h=1 标签, 避免默认 cross_binary
+        # 被静默忽略(此前一直用 build_features 的 R>0 标签)
+        labels = build_multilabels(df, tradable, (1,), exec_lag=1,
+                                   label_type=args.label_type)
+        y_all = labels[1][1].astype(np.float32)
     del df, next_ret, base
     gc.collect()
 
@@ -1615,6 +1621,23 @@ def main():
     configs = make_configs(args.mode, groups)
     log(f"消融配置 {len(configs)} 个: {['+'.join(c) for c in configs]}")
 
+    # 普通消融模式也接入 rankic 自定义目标(此前仅 horizon/walkforward 生效)
+    train_params, feval = params, None
+    if rankic_mode:
+        from rank_ic_objective import (make_auc_eval,
+                                       make_lambdarank_ic_objective,
+                                       make_mse_eval, make_rank_ic_eval)
+        R1 = labels[1][0]
+        train_params = dict(params)
+        train_params["objective"] = make_lambdarank_ic_objective(
+            R1[tr_idx], dates[tr_idx], weights=w_tr)
+        train_params["metric"] = "None"
+        feval = [make_rank_ic_eval(R1[va_idx], dates[va_idx])]
+        if label_type in ("binary", "cross_binary"):
+            feval.append(make_auc_eval(y_va))
+        else:
+            feval.append(make_mse_eval(y_va))
+
     rows, imps = [], {}
     for cfg in configs:
         label = "+".join(cfg)
@@ -1630,12 +1653,15 @@ def main():
         del Xva
         gc.collect()
         model = lgb.train(
-            params, dtr, num_boost_round=args.rounds, valid_sets=[dva],
+            train_params, dtr, num_boost_round=args.rounds,
+            valid_sets=[dva], feval=feval,
             callbacks=[lgb.early_stopping(150, first_metric_only=True,
                                           verbose=False),
                        lgb.log_evaluation(200)])
         Xva = build_config(names, cfg, va_idx)
         p_va = model.predict(Xva, num_iteration=model.best_iteration)
+        if rankic_mode and label_type in ("binary", "cross_binary"):
+            p_va = 1.0 / (1.0 + np.exp(-np.clip(p_va, -50, 50)))
         del Xva
         gc.collect()
         Xtr = build_config(names, cfg, tr_sub)

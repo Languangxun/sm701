@@ -226,7 +226,7 @@ def main():
                 (tech_cols if g == "tech" else pattern_cols)]
         idx = [col_of[c] for c in cols]
         vals = np.ascontiguousarray(full[:, idx])
-        mean, std = standardize(vals, tr_idx)
+        standardize(vals, tr_idx)  # 用训练集统计量就地标准化(缺失填0)
         log(f"[{cfg}] 特征 {len(cols)}, TCN(GPU) 与 LGBM(CPU) "
             f"{'并行' if not args.no_parallel else '串行'}训练 ...")
 

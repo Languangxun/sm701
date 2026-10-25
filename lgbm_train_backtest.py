@@ -7,7 +7,7 @@ LightGBM 上涨概率模型 + 训练集/验证集分段回测
 - 标签: 次日 开盘->收盘 涨跌 (close[t+1] > open[t+1]) -> 二分类, 输出 P(上涨)
 - 切分: 训练集 2018-01-01 ~ 2023-12-31, 验证集 2024-01-01 之后 (纯样本外)
 - 回测: t 日收盘出信号, t+1 开盘买入, t+1 收盘卖出 (等权, TopK/概率阈值, 含换手成本)
-  可交易性过滤: 次日开盘一字/涨停封板无法买入、停牌超过7个自然日的样本剔除
+  可交易性过滤: 次日开盘一字/涨停封板无法买入、停牌间隔超过5个交易日的样本剔除
 
 用法:
     python3 lgbm_train_backtest.py                # 全量
@@ -58,8 +58,6 @@ FEATURES = [
     "r_vr20", "r_vol20", "r_logvol",
 ]
 
-
-from typing import Any, Dict, List, Tuple
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
