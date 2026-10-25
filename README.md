@@ -426,7 +426,7 @@ Platt/Isotonic 实验（2024 拟合 → 2025–2026 评估，223 万样本，`re
 | `lgbm_output/` | LGBM 基线：模型/重要度/回测汇总/逐日净值/分档/年AUC/**逐样本验证预测**（校准用） |
 | `ensemble_output/` | LGBM+TCN：三路评估与回测、融合权重扫描、逐样本预测 |
 | `ablation_output/` | 消融：`ablation_results.csv`（排序对比）、`ablation_importance.csv`、`horizon_results.csv`（+`config`列/分年度 `auc_年`/`ic_年`列/`holdP*`阈值持有列）、`holdbacktest_summary/daily.csv`（TopK + `Hold{h}P{thr}` 阈值策略）、`walkforward_results.csv` + `holdbacktest_wf_*`（walk-forward 窗口与 holdout）、`lgbm_all.txt`、`lgbm_h{h}[_all].txt`、`lhb_deepdive.md`、`lhb_monthly.csv`、`run_config.json` |
-| `production/` | **生产定稿**：`prod_h1/h5/h10_tech.txt`（三周期 tech 模型，见 §18）+ `features_tech.json`（40 特征名/列序）；`make_predictions.py` 生成 `valid_predictions.csv.gz`（2024-01 起全市场样本外 `date,code,prob_h1,prob_h5,prob_h10,prob`，`prob`=三模型等权平均，供 stock_predict `test` 档读取） |
+| `production/` | **生产定稿**：`prod_h1/h5/h10_tech.txt`（A股三周期 tech 模型，见 §18）+ `prod_{hk,us,fut}_h{1,5,10}_tech.txt`（多市场生产模型，见 §18.1）+ `features_tech.json`（40 特征名/列序）；`make_predictions.py [--market cn/hk/us/fut]` 生成 `valid_predictions[_市场].csv.gz`（2024-01 起样本外 `date,code,prob_h1,prob_h5,prob_h10,prob`，`prob`=三模型等权平均，供 stock_predict `test` 档读取） |
 | `tcn_output/` | `tcn_results.csv`、`backtest_report.md`、`backtest_summary.csv` |
 | `reports/` | 清洗报告 / 校准评估 / 校准对比（日期命名） |
 
@@ -463,6 +463,22 @@ p = booster.predict(X)  # X 列序按 man["features"]
 ```
 - 执行与回测一致（T+1：t 收盘出信号、t+1 开盘成交，成本万 15，剔除 t+1 开盘涨停封板）；阈值参考 §11.6–11.7 可信档（`h=1/tech P0.60`、`h=10/fund P0.55`），阈值策略强制 `--hold-min-cov 0.2`（默认）过滤小样本假象。
 - 风险：结论全部处于 2024–2026 牛市样本内（基准年化 33.4%）；lhb/fund 类高 beta 组合上生产必须配 `--regime` 过滤与 `--max-dd` 回撤控制；建议 walk-forward + holdout 复核后再放量。
+
+### 18.1 多市场生产定稿（2026-10-25，按市场分开各取最强）
+
+港股/美股/期货 tech 三周期模型提升为生产，口径与 A 股一致（tech 40 特征 + cross_binary 标签，
+训练 2018–2023 / 验证 2024+，详见 §19）：
+
+| 市场 | 模型 | 验证 AUC / IC（h1 · h5 · h10） | 状态 |
+|---|---|---|---|
+| 港股 | `production/prod_hk_h{1,5,10}_tech.txt` | 0.5563/0.0975 · 0.5536/0.1078 · 0.5620/0.1244 | **可用**（分年 IC 0.09–0.14 最稳） |
+| 美股 | `production/prod_us_h{1,5,10}_tech.txt` | ≈0.50 / ≈0.005 | 先按此使用（标普500 技术 IC≈0，仅供参考） |
+| 期货 | `production/prod_fut_h{1,5,10}_tech.txt` | 0.5078/0.0111 · 0.5157/0.0268 · 0.5165/0.0317 | 弱信号，辅助参考 |
+
+- 样本外预测文件（列同 A 股 `valid_predictions.csv.gz`）：
+  `python3 production/make_predictions.py --market hk|us|fut` →
+  `production/valid_predictions_{hk,us,fut}.csv.gz`（2024-01 起，`date,code,prob_h1,prob_h5,prob_h10,prob`）。
+- 统一预测入口：`predict_code.py`（§19.4）自动识别市场并选择对应生产模型。
 
 ---
 
@@ -529,7 +545,27 @@ nohup python3 train_markets.py > markets.log 2>&1 &
   期货 TopK 列成本口径过重（万 15 是股票口径），无参考意义。
 - 模型 `markets_output/{market}_h{h}.txt`，推理同 §18。
 
-### 19.4 已知限制
+### 19.4 统一预测入口
+
+`predict_code.py`：输入任意代码，自动识别市场并选择对应策略模型（全部同一语义：
+**截面跑赢当日中位数的概率**，T+1 开盘执行；附当日截面分位）。
+
+| 输入形态 | 识别 | 策略（模型，均已在 production/ 定稿） |
+|---|---|---|
+| 6 位数字/带 sh·sz·bj 前缀 | A股 | `production/prod_h{1,5,10}_tech.txt`（可用） |
+| 数字 1–5 位自动补零（700→00700） | 港股 | `production/prod_hk_h{1,5,10}_tech.txt`（技能最强，可用） |
+| 字母代码（AAPL，标普500池内） | 美股 | `production/prod_us_h{1,5,10}_tech.txt`（IC≈0，先按此使用） |
+| 字母+数字（RB0，主力连续） | 期货 | `production/prod_fut_h{1,5,10}_tech.txt`（弱信号，辅助参考） |
+
+```bash
+python3 predict_code.py sh600519 00700 AAPL RB0   # 混合输入, 自动分组
+python3 predict_code.py 00700 --date 2026-10-01   # 指定信号日
+```
+
+实现：按市场取最近约 270 个交易日**全市场**行情算特征（tech 40 列，截面排名限当日；
+EMA 类递推指标 270 日预热，与全历史差异可忽略），取目标代码最新一行过对应模型。
+
+### 19.5 已知限制
 
 1. 不复权数据导致除权日伪收益，靠样本剔除 + 截断缓解，未做精确复权；
 2. 期货主力连续移仓跳空未做后复权拼接；

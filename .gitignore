@@ -12,3 +12,7 @@ stock_cache.db*
 *.npy
 __pycache__/
 *.pyc
+production/valid_predictions_hk.csv.gz
+production/valid_predictions_us.csv.gz
+production/valid_predictions_fut.csv.gz
+markets_output/*.txt
