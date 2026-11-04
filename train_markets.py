@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-港股/美股/期货 三市场 LightGBM 横截面模型 (tech 40 特征 + cross_binary 标签)
+港股/美股/期货/加密货币 LightGBM 横截面模型 (tech 40 特征 + cross_binary 标签)
 
 口径与 A 股生产定稿 (README §18) 一致:
   特征   tech 40 列 (production/features_tech.json), 全部 t 日及以前
   标签   cross_binary: R_h = close[t+h]/open[t+1] - 1, 截面 > 当日中位数
   切分   训练 2018-01-01 ~ 2023-12-31 / 验证 2024-01-01 起 (按年硬切)
   模型   LGBM binary, lr=0.03 / leaves=31 / min_data=1000 / ff=0.6 / bag=0.7
-  执行   T+1 开盘买入持有 h 天, 成本单程万 15
+  执行   T+1 开盘买入持有 h 天, 成本按市场配置
 
-与 A 股的差异 (数据源为新浪不复权日线):
+与 A 股的差异:
   - 美股/港股分红拆股会产生收益跳变: |R_h| > 0.5 (期货 0.25) 的样本剔除,
     RankIC 评估用 R 截断 (股票 ±0.30 / 期货 ±0.10);
+  - 加密货币无拆股, 保留真实极端收益 (|R_h| <= 5), IC 截断 ±100%;
+    年化按 365 天, 双边成本 0.2%;
   - cross_binary 取截面中位数, 对离群值本身稳健;
   - 期货为主力连续合约, 移仓换月存在跳空, 同上处理;
-  - 无涨跌停/停牌过滤 (港美无涨跌停, 期货 T+0)。
+  - 无涨跌停/停牌过滤 (港美无涨跌停, 期货/加密 T+0)。
 
 用法:
-    python3 train_markets.py --markets hk,us,fut --horizons 1,5,10
+    python3 train_markets.py --markets hk,us,fut,crypto --horizons 1,5,10
+    python3 train_markets.py --markets crypto --horizons 1,5,10
     python3 train_markets.py --markets hk --limit 300     # 冒烟
     nohup python3 train_markets.py > markets.log 2>&1 &
 """
@@ -49,9 +52,11 @@ COST_RT = 0.003                    # 万15单程 ×2 (进+出)
 N_TRADE_DAYS = 243
 
 MARKETS = {
-    "hk":  {"table": "hk_daily",  "drop_abs": 0.50, "clip_ic": 0.30},
-    "us":  {"table": "us_daily",  "drop_abs": 0.50, "clip_ic": 0.30},
-    "fut": {"table": "fut_daily", "drop_abs": 0.25, "clip_ic": 0.10},
+    "hk":     {"table": "hk_daily",     "drop_abs": 0.50, "clip_ic": 0.30},
+    "us":     {"table": "us_daily",     "drop_abs": 0.50, "clip_ic": 0.30},
+    "fut":    {"table": "fut_daily",    "drop_abs": 0.25, "clip_ic": 0.10},
+    "crypto": {"table": "crypto_daily", "drop_abs": 5.00, "clip_ic": 1.00,
+               "cost_rt": 0.002, "days": 365},
 }
 
 PARAMS = {
@@ -133,7 +138,8 @@ def rank_ic(pred, meta, clip):
     return float(ic.mean()), float(ic.mean() / (ic.std() + 1e-9)), ic
 
 
-def topk_stats(pred, meta, h, clip, k_list=(10, 50)):
+def topk_stats(pred, meta, h, clip, k_list=(10, 50),
+               cost_rt=COST_RT, days=N_TRADE_DAYS):
     d = pd.DataFrame({"date": meta["date"].values, "p": pred,
                       "R": np.clip(meta["R"].values, -clip, clip)})
     rows = []
@@ -145,8 +151,8 @@ def topk_stats(pred, meta, h, clip, k_list=(10, 50)):
         rows.append({
             "topk": k,
             "topk_R": float(tk.mean()), "base_R": float(base.mean()),
-            "topk_ann_net": (float(tk.mean()) - COST_RT) / h * N_TRADE_DAYS,
-            "base_ann": float(base.mean()) / h * N_TRADE_DAYS,
+            "topk_ann_net": (float(tk.mean()) - cost_rt) / h * days,
+            "base_ann": float(base.mean()) / h * days,
             "cover": float(tk.notna().mean()),
         })
     return rows
@@ -191,7 +197,9 @@ def train_market(market, horizons, limit, seed, threads):
                     include_groups=False).mean()}),
             include_groups=False)
 
-        tops = topk_stats(pred, meta_va, h, cfg["clip_ic"])
+        tops = topk_stats(pred, meta_va, h, cfg["clip_ic"],
+                          cost_rt=cfg.get("cost_rt", COST_RT),
+                          days=cfg.get("days", N_TRADE_DAYS))
 
         os.makedirs(OUT, exist_ok=True)
         model.booster_.save_model(os.path.join(OUT, f"{market}_h{h}.txt"))
@@ -237,9 +245,14 @@ def main():
 
     os.makedirs(OUT, exist_ok=True)
     res = pd.DataFrame(all_rows)
-    res.to_csv(os.path.join(OUT, "markets_results.csv"), index=False)
+    path = os.path.join(OUT, "markets_results.csv")
+    if os.path.exists(path):
+        old = pd.read_csv(path)
+        old = old[~old["market"].isin(markets)]
+        res = pd.concat([old, res], ignore_index=True)
+    res.to_csv(path, index=False)
     print(res.to_string(index=False))
-    log(f"结果已写入 {OUT}/markets_results.csv, 模型 {OUT}/<market>_h<h>.txt")
+    log(f"结果已写入 {path}, 模型 {OUT}/<market>_h<h>.txt")
 
 
 if __name__ == "__main__":

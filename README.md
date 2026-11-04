@@ -482,9 +482,9 @@ p = booster.predict(X)  # X 列序按 man["features"]
 
 ---
 
-## 19. 多市场：港股/美股/期货
+## 19. 多市场：港股/美股/期货/加密货币
 
-2026-10-25 新增三个市场的独立模型：同一套「tech 40 特征 + cross_binary 标签 + LGBM」框架复用 A 股生产定稿口径（§18），每个市场独立训练。
+2026-10-25 新增港/美/期货三个市场的独立模型；2026-11-04 新增加密货币市场。同一套「tech 40 特征 + cross_binary 标签 + LGBM」框架复用 A 股生产定稿口径（§18），每个市场独立训练。
 
 ### 19.1 数据层
 
@@ -492,9 +492,10 @@ p = booster.predict(X)  # X 列序按 man["features"]
 
 | 表 | 行数 | 内容 |
 |---|---|---|
-| `hk_daily` | 649 万 | 港股日线 2010-01 ~ ，2805 只（新浪 `stock_hk_spot` 全量池，5 位代码） |
-| `us_daily` | 181 万 | 美股日线 2010-01 ~ ，501 只（标普 500 成分，`us_tickers.txt`，维基/datahub 下载） |
-| `fut_daily` | 19.6 万 | 期货主力连续日线 2010-01 ~ ，82 个合约（`futures_display_main_sina`） |
+| `hk_daily` | 652 万 | 港股日线 2010-01 ~ ，2815 只（新浪 `stock_hk_spot` 全量池，5 位代码） |
+| `us_daily` | 182 万 | 美股日线 2010-01 ~ ，503 只（标普 500 成分，`us_tickers.txt`，维基/datahub 下载） |
+| `fut_daily` | 19.7 万 | 期货主力连续日线 2010-01 ~ ，82 个合约（`futures_display_main_sina`） |
+| `crypto_daily` | 15.6 万 | 加密货币 USDT 现货日线 2017-08 ~ ，100 个币种（Binance，币池冻结在 `crypto_tickers.txt`） |
 | `global_codes` / `global_progress` | — | 股票池快照 / 抓取进度（断点续跑） |
 
 抓取脚本 `fetch_global_data.py`（断点续跑/重试/多线程，与 §3 三个脚本同框架）：
@@ -503,13 +504,19 @@ p = booster.predict(X)  # X 列序按 man["features"]
 python3 fetch_global_data.py --limit 3                 # 冒烟
 nohup python3 fetch_global_data.py --workers 4 > global.log 2>&1 &
 python3 fetch_global_data.py --datasets hk,fut         # 指定市场
+python3 fetch_global_data.py --datasets crypto --redo               # 按 crypto_tickers.txt 补全
+python3 fetch_global_data.py --datasets crypto --crypto-refresh      # 重选币池
 ```
 
 数据口径注意：
 - 新浪日线**均不复权**：美股/港股分红拆股会产生收益跳变，期货主力连续有移仓换月跳空；
 - 训练侧处理：`|R_h| > 0.5`（期货 0.25）的样本剔除（几乎必为除权/移仓伪收益），RankIC 评估对 R 截断（股票 ±0.30 / 期货 ±0.10）；
 - `cross_binary` 标签取截面中位数，对离群值本身稳健；
-- 港美无涨跌停、期货 T+0，不适用 A 股的涨停/停牌可交易过滤。
+- 港美无涨跌停、期货 T+0，不适用 A 股的涨停/停牌可交易过滤；
+- 加密数据来自 Binance USDT 现货，按 UTC 00:00 切日；`vol` 存 USDT 计价成交额（quote volume）；
+  首次按 24h 成交额取有 ≥250 天历史的前 100 个币种并冻结到 `crypto_tickers.txt`（当前快照，存在幸存者偏差；
+  `--crypto-refresh` 才会重选）；排除稳定币/杠杆代币；
+  无拆股，保留真实极端收益（`|R_h| <= 5`），RankIC 评估截断 ±100%。
 
 ### 19.2 训练
 
@@ -519,15 +526,17 @@ python3 fetch_global_data.py --datasets hk,fut         # 指定市场
 - 标签：`R_h = close[t+h]/open[t+1] − 1`，截面 > 当日中位数（cross_binary）；当日截面 < 10 只剔除；
 - 切分：训练 2018–2023 / 验证 2024+（按年硬切），代码要求 ≥250 根 K 线、2016 年起载入（60 日窗口 warmup）；
 - 超参：与 §7.1 相同（lr 0.03 / leaves 31 / min_data 1000 / ff 0.6 / bag 0.7 / l2 20），验证集早停 150 轮；
-- 评估：验证 AUC / LogLoss / RankIC（截断 R）/ ICIR / 分年 AUC·IC + Top10/Top50 等权持有 h 天年化净收益（成本单程万 15）。
+- 评估：验证 AUC / LogLoss / RankIC（截断 R）/ ICIR / 分年 AUC·IC + Top10/Top50 等权持有 h 天年化净收益
+  （股票/期货成本单程万 15，加密双边 0.2%、年化按 365 天）。
 
 ```bash
-python3 train_markets.py --markets hk,us,fut --horizons 1,5,10   # 全量
-python3 train_markets.py --markets hk --limit 60                 # 冒烟
+python3 train_markets.py --markets hk,us,fut,crypto --horizons 1,5,10   # 全量
+python3 train_markets.py --markets crypto --horizons 1,5,10             # 加密
+python3 train_markets.py --markets hk --limit 60                        # 冒烟
 nohup python3 train_markets.py > markets.log 2>&1 &
 ```
 
-### 19.3 结果（2026-10-25 定稿，验证集 2024-01 ~ 2026-10）
+### 19.3 结果（2026-11-05 定稿，验证集 2024-01 ~ 2026-11）
 
 | 市场 | 周期 | AUC | RankIC | ICIR | 判读 |
 |---|---|---|---|---|---|
@@ -538,12 +547,17 @@ nohup python3 train_markets.py > markets.log 2>&1 &
 | 期货 | T+1 | 0.5078 | 0.0111 | 0.08 | 弱信号 |
 | 期货 | T+5 | 0.5157 | 0.0268 | 0.16 | 弱信号 |
 | 期货 | T+10 | 0.5165 | 0.0317 | 0.18 | 分年 0.027/0.031/0.040 一致，可做辅助加权 |
+| 加密 | T+1 | 0.5258 | 0.0528 | 0.36 | 日频被 0.2% 双边成本吃掉，Top10 净年化 −36.5% |
+| 加密 | T+5 | 0.5316 | 0.0609 | 0.42 | 信号增强，Top10 净年化 +15.5% |
+| 加密 | T+10 | **0.5402** | **0.0776** | **0.53** | 三周期最强；分年 IC 0.079/0.079/0.074，Top10 净年化 +33.5% |
 
 - 完整表（含分年 AUC/IC、TopK 净年化）：`markets_output/markets_results.csv`、
   `markets_output/markets_report.md`。
 - 港股 TopK 净年化（h=1 +478%）受 2024–2026 牛市 + 收益截断效应影响严重虚高，以 IC/ICIR 为准；
   期货 TopK 列成本口径过重（万 15 是股票口径），无参考意义。
-- 模型 `markets_output/{market}_h{h}.txt`，推理同 §18。
+- 加密 IC 随持有期单调上升（h=1 0.0528 → h=10 0.0776），但 h=1 换手成本过高；
+  实盘应看 h=5/10。TopK 为多币等权、T+1 开盘执行，未做 BTC beta 对冲。
+- 模型 `markets_output/{market}_h{h}.txt`，推理同 §18；加密模型目前只用于研究回测，未复制到 `production/`。
 
 ### 19.4 统一预测入口
 
@@ -570,4 +584,6 @@ EMA 类递推指标 270 日预热，与全历史差异可忽略），取目标�
 1. 不复权数据导致除权日伪收益，靠样本剔除 + 截断缓解，未做精确复权；
 2. 期货主力连续移仓跳空未做后复权拼接；
 3. 港股池为新浪全量（含大量仙股/低流动性），未按成交额过滤；美股仅标普 500 成分（当前快照，有幸存者偏差——2024+ 验证集影响小，2018–2023 训练段用的是「今天还在指数里」的名单）；
-4. 期货 82 个合约的每日截面较小，cross_binary 中位数稳定性一般；也可改做逐合约时序标签（未实现）。
+4. 期货 82 个合约的每日截面较小，cross_binary 中位数稳定性一般；也可改做逐合约时序标签（未实现）；
+5. 加密池为「当前」24h 成交额前 100 且有 ≥250 天历史的币种，同样存在当前快照/幸存者偏差，且币种轮换会让历史截面在早期偏小（2018 年日均仅 4 个币，2019 年后才逐步可用）；未做退市币回填；
+6. 加密日线按 UTC 切日、7×24 连续交易，与股票 T+1 日历不同；回测按每日收盘出信号、次日 00:00 UTC 开盘执行，未建模资金费率/滑点/交易所差异；TopK 收益未做 BTC beta 对冲，牛市/熊市 beta 会主导绝对收益。

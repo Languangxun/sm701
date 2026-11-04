@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-港股/美股/期货日线爬取 (akshare 新浪源 -> stock_cache.db)
+港股/美股/期货/加密货币日线爬取 (akshare 新浪源 + Binance -> stock_cache.db)
 
 表 (stock_cache.db):
-  hk_daily  港股日线: code(5位)/date/open/high/low/close/vol
-  us_daily  美股日线: code(标普500代码)/date/open/high/low/close/vol
-  fut_daily 期货主力连续日线: code(如RB0)/date/open/high/low/close/vol/hold/settle
+  hk_daily     港股日线: code(5位)/date/open/high/low/close/vol
+  us_daily     美股日线: code(标普500代码)/date/open/high/low/close/vol
+  fut_daily    期货主力连续日线: code(如RB0)/date/open/high/low/close/vol/hold/settle
+  crypto_daily 加密货币日线: code(BTCUSDT)/date/open/high/low/close/vol
+               vol 为 USDT 计价成交额 (quote volume)
   global_codes   股票池快照 (dataset/code/name)
   global_progress 抓取进度 (dataset, key)
 
 股票池:
-  hk  ak.stock_hk_spot()               全部港股 (约2800只)
-  us  us_tickers.txt                   标普500成分股 (fetch_global_data 同目录)
-  fut ak.futures_display_main_sina()   全部主力连续合约 (约82个)
+  hk      ak.stock_hk_spot()               全部港股 (约2800只)
+  us      us_tickers.txt                   标普500成分股 (fetch_global_data 同目录)
+  fut     ak.futures_display_main_sina()   全部主力连续合约 (约82个)
+  crypto  Binance USDT 现货按 24h 成交额取前 N (默认100, 排除稳定币);
+          首次选择后冻结在 crypto_tickers.txt, --crypto-refresh 重选
 
 特性: 断点续跑(global_progress), 失败重试, 多线程抓取+单线程入库, 幂等覆盖
 
@@ -21,16 +25,20 @@
     python3 fetch_global_data.py --limit 5                 # 冒烟
     python3 fetch_global_data.py                           # 全量(默认3线程)
     python3 fetch_global_data.py --datasets hk,fut         # 指定数据集
+    python3 fetch_global_data.py --datasets crypto --crypto-top 100
+    python3 fetch_global_data.py --datasets crypto --crypto-refresh  # 重选币池
     python3 fetch_global_data.py --redo                    # 忽略进度重抓
     nohup python3 fetch_global_data.py > global.log 2>&1 &
 
 注意: 新浪源日线均为不复权价, 美股/港股的分红拆股会产生跳变;
       训练侧 (train_markets.py) 对极端收益做截断处理, cross_binary
       标签取截面中位数, 对离群值稳健。
+      Binance 日线按 UTC 00:00 切日, 永续/现货连续交易, 无停牌缺口。
 """
 import argparse
 import os
 import random
+import re
 import sqlite3
 import time
 import warnings
@@ -39,13 +47,26 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import akshare as ak
 import numpy as np
 import pandas as pd
+import requests
 
 warnings.filterwarnings("ignore")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(HERE, "stock_cache.db")
 TICKER_FILE = os.path.join(HERE, "us_tickers.txt")
+CRYPTO_TICKER_FILE = os.path.join(HERE, "crypto_tickers.txt")
 START_DEFAULT = "20100101"
+BINANCE_BASE = "https://data-api.binance.vision"
+CRYPTO_TOP = 100
+CRYPTO_MIN_DAYS = 250
+
+STABLE_BASES = {
+    "USDT", "USDC", "BUSD", "FDUSD", "TUSD", "DAI", "USDP", "USD1",
+    "USDE", "USDS", "PYUSD", "GUSD", "FRAX", "LUSD", "RLUSD", "BFUSD",
+    "XUSD", "EUR", "EURI", "AEUR", "GBPT", "TRY", "BRL", "ARS",
+    "JPY", "USD", "USTC", "UST",
+}
+LEVERAGED_SUFFIX = re.compile(r"(3L|3S|5L|5S)$")
 
 BAR_COLS = {"日期": "date", "开盘价": "open", "最高价": "high",
             "最低价": "low", "收盘价": "close", "成交量": "vol",
@@ -80,6 +101,57 @@ def universe_fut():
     return list(zip(df["symbol"].astype(str), df["name"].astype(str)))
 
 
+def universe_crypto(refresh=False):
+    if os.path.exists(CRYPTO_TICKER_FILE) and not refresh:
+        syms = [s.strip() for s in open(CRYPTO_TICKER_FILE, encoding="utf-8")
+                if s.strip() and not s.startswith("#")]
+        return [(s, s[:-4] if s.endswith("USDT") else s) for s in syms]
+
+    last_err = None
+    for attempt in range(3):
+        try:
+            info = requests.get(f"{BINANCE_BASE}/api/v3/exchangeInfo",
+                                timeout=30).json()
+            tick = requests.get(f"{BINANCE_BASE}/api/v3/ticker/24hr",
+                                timeout=30).json()
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(2.0 ** attempt + random.random())
+    else:
+        raise SystemExit(f"Binance 股票池获取失败: {last_err}")
+
+    qv = {r["symbol"]: float(r.get("quoteVolume") or 0) for r in tick}
+    pairs = []
+    for s in info["symbols"]:
+        base = s["baseAsset"]
+        if s["quoteAsset"] != "USDT" or s["status"] != "TRADING":
+            continue
+        if base in STABLE_BASES or LEVERAGED_SUFFIX.search(base):
+            continue
+        pairs.append((s["symbol"], base))
+    pairs.sort(key=lambda x: qv.get(x[0], 0.0), reverse=True)
+
+    min_ms = int((time.time() - CRYPTO_MIN_DAYS * 86_400) * 1000)
+    picked = []
+    for symbol, base in pairs:
+        if len(picked) >= CRYPTO_TOP:
+            break
+        try:
+            r = requests.get(f"{BINANCE_BASE}/api/v3/klines",
+                             params={"symbol": symbol, "interval": "1d",
+                                     "startTime": 0, "limit": 1}, timeout=20)
+            r.raise_for_status()
+            first = r.json()
+            if first and int(first[0][0]) <= min_ms:
+                picked.append((symbol, base))
+        except Exception:
+            continue
+    with open(CRYPTO_TICKER_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(s for s, _ in picked) + "\n")
+    return picked
+
+
 # ---------------------------------------------------------------- 抓取
 def fetch_hk(code, start):
     df = ak.stock_hk_daily(symbol=code)
@@ -92,7 +164,12 @@ def fetch_hk(code, start):
 
 
 def fetch_us(code, start):
-    df = ak.stock_us_daily(symbol=code)
+    try:
+        df = ak.stock_us_daily(symbol=code)
+    except Exception:
+        if "-" not in code:
+            raise
+        df = ak.stock_us_daily(symbol=code.replace("-", "."))
     df["date"] = fmt_date(df["date"])
     df = df[df["date"] >= start]
     df = df[["date", "open", "high", "low", "close", "volume"]]
@@ -112,6 +189,45 @@ def fetch_fut(code, start):
     return df.dropna(subset=["close"])
 
 
+def fetch_crypto(code, start):
+    start_ms = int(pd.Timestamp(start, tz="UTC").timestamp() * 1000)
+    rows = []
+    while True:
+        params = {"symbol": code, "interval": "1d",
+                  "startTime": start_ms, "limit": 1000}
+        r = requests.get(f"{BINANCE_BASE}/api/v3/klines", params=params,
+                         timeout=30)
+        if r.status_code == 429:
+            time.sleep(5)
+            continue
+        r.raise_for_status()
+        chunk = r.json()
+        if not chunk:
+            break
+        rows.extend(chunk)
+        if len(chunk) < 1000:
+            break
+        start_ms = int(chunk[-1][0]) + 86_400_000
+        time.sleep(0.1)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_vol", "trades", "taker_base",
+        "taker_quote", "ignore"])
+    now_ms = int(time.time() * 1000)
+    df = df[pd.to_numeric(df["close_time"], errors="coerce") < now_ms]
+    df["date"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.strftime(
+        "%Y-%m-%d")
+    for c in ["open", "high", "low", "close", "quote_vol"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.rename(columns={"quote_vol": "vol"})
+    df.insert(0, "code", code)
+    df = df[["code", "date", "open", "high", "low", "close", "vol"]]
+    df = df[(df["close"] > 0) & (df["open"] > 0)]
+    return df.dropna(subset=["close"]).drop_duplicates("date")
+
+
 # ---------------------------------------------------------------- 入库
 def sql_type(s) -> str:
     if pd.api.types.is_bool_dtype(s) or pd.api.types.is_integer_dtype(s):
@@ -121,7 +237,8 @@ def sql_type(s) -> str:
     return "TEXT"
 
 
-TABLE_OF = {"hk": "hk_daily", "us": "us_daily", "fut": "fut_daily"}
+TABLE_OF = {"hk": "hk_daily", "us": "us_daily", "fut": "fut_daily",
+            "crypto": "crypto_daily"}
 
 
 class Writer:
@@ -175,6 +292,18 @@ class Writer:
                 "INSERT OR REPLACE INTO global_codes(dataset,code,name) "
                 "VALUES(?,?,?)", [(dataset, c, n) for c, n in pairs])
 
+    def prune_codes(self, dataset, codes):
+        table = TABLE_OF[dataset]
+        if not codes:
+            return
+        ph = ",".join("?" * len(codes))
+        with self.con:
+            self.con.execute(f'DELETE FROM "{table}" WHERE code NOT IN ({ph})',
+                             list(codes))
+            self.con.execute(
+                f"DELETE FROM global_progress WHERE dataset=? "
+                f"AND key NOT IN ({ph})", [dataset] + list(codes))
+
     def mark(self, dataset, key, status, rows, error):
         with self.con:
             self.con.execute(
@@ -201,8 +330,8 @@ def worker(args_tuple):
     df, err = None, None
     for attempt in range(max(1, retry)):
         try:
-            df = {"hk": fetch_hk, "us": fetch_us, "fut": fetch_fut}[dataset](
-                key, start)
+            df = {"hk": fetch_hk, "us": fetch_us, "fut": fetch_fut,
+                  "crypto": fetch_crypto}[dataset](key, start)
             if df is None:
                 df = pd.DataFrame()
             if not df.empty:
@@ -219,11 +348,16 @@ def worker(args_tuple):
 
 
 def main():
+    global CRYPTO_TOP
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=DB)
     ap.add_argument("--datasets", default="hk,us,fut")
     ap.add_argument("--start", default=START_DEFAULT,
                     help="起始日期 YYYYMMDD (默认 20100101)")
+    ap.add_argument("--crypto-top", type=int, default=CRYPTO_TOP,
+                    help="加密市场按 24h 成交额取前 N (默认100)")
+    ap.add_argument("--crypto-refresh", action="store_true",
+                    help="重新按 24h 成交额选择加密币池并写 crypto_tickers.txt")
     ap.add_argument("--limit", type=int, default=0, help="每市场抽样(冒烟)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--workers", type=int, default=3)
@@ -233,6 +367,7 @@ def main():
     ap.add_argument("--log-every", type=int, default=50)
     args = ap.parse_args()
 
+    CRYPTO_TOP = max(1, args.crypto_top)
     datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
     for d in datasets:
         if d not in TABLE_OF:
@@ -244,13 +379,19 @@ def main():
 
     tasks = []
     for ds in datasets:
-        pairs = {"hk": universe_hk, "us": universe_us,
-                 "fut": universe_fut}[ds]()
+        if ds == "crypto":
+            pairs = universe_crypto(args.crypto_refresh)
+        else:
+            pairs = {"hk": universe_hk, "us": universe_us,
+                     "fut": universe_fut}[ds]()
         if args.limit and len(pairs) > args.limit:
             rs = np.random.RandomState(args.seed)
             idx = sorted(rs.choice(len(pairs), args.limit, replace=False))
             pairs = [pairs[i] for i in idx]
-        writer.write_codes(ds, pairs)
+        if not (ds == "crypto" and args.limit):
+            writer.write_codes(ds, pairs)
+        if ds == "crypto" and not args.limit:
+            writer.prune_codes(ds, [c for c, _ in pairs])
         log(f"{ds} 股票池 {len(pairs)} 个代码")
         tasks += [(ds, c, start, args.retry, args.sleep) for c, _ in pairs]
 
