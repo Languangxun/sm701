@@ -497,6 +497,7 @@ p = booster.predict(X)  # X 列序按 man["features"]
 | `us_daily` | 182 万 | 美股日线 2010-01 ~ ，503 只（标普 500 成分，`us_tickers.txt`，维基/datahub 下载） |
 | `fut_daily` | 19.7 万 | 期货主力连续日线 2010-01 ~ ，82 个合约（`futures_display_main_sina`） |
 | `crypto_daily` | 15.6 万 | 加密货币 USDT 现货日线 2017-08 ~ ，100 个币种（Binance，币池冻结在 `crypto_tickers.txt`） |
+| `crypto_hourly` | 375 万 | 加密 1h 小时线（同币池，BTC 2017-08 起，`data-api.binance.vision`；Binance 主域名在本区域 451 受限，用 vision 域名） |
 | `global_codes` / `global_progress` | — | 股票池快照 / 抓取进度（断点续跑） |
 
 抓取脚本 `fetch_global_data.py`（断点续跑/重试/多线程，与 §3 三个脚本同框架）：
@@ -507,6 +508,12 @@ nohup python3 fetch_global_data.py --workers 4 > global.log 2>&1 &
 python3 fetch_global_data.py --datasets hk,fut         # 指定市场
 python3 fetch_global_data.py --datasets crypto --redo               # 按 crypto_tickers.txt 补全
 python3 fetch_global_data.py --datasets crypto --crypto-refresh      # 重选币池
+```
+
+加密小时线抓取（`fetch_crypto_intraday.py`，断点续跑）：
+
+```bash
+nohup python3 fetch_crypto_intraday.py --workers 4 > crypto_intraday.log 2>&1 &
 ```
 
 数据口径注意：
@@ -590,6 +597,19 @@ python3 train_crypto_ab.py --variants E1 --horizons 1,5,10
 - E4 中尤其有害的是「相对 BTC 动量 diff」类列与 tech 40 的 `r_ret5/r_ret20/r_ret60` 横截面分位高度重合；
   建议后续若再加特征，先做 drop-one 单变量消融（②），不要批量加列。
 - h1 在所有口径下 Top10 净年化均为负（base −69.4% → E1 −46.4%），确认为**不可交易**而非标签问题；h1 生产模型保留供参考，不作选币使用。
+
+### 19.3.2 加密分时细节（hourly）消融（2026-11-07，阴性结果）
+
+数据：`crypto_hourly`（§19.1），375 万行 1h K 线。`train_crypto_intraday.py` 在 E1 口径下加日内特征：
+
+| 变种 | 特征 | h=5 IC_Rex | h=10 IC_Rex | Top10_ann_net(h10) | 结论 |
+|---|---|---|---|---|---|
+| E1 | tech40 | 0.0596 | 0.0791 | +11.2% | 生产（不升级） |
+| E1Rv | +rv24/rv168/mom4/mom8（4 列） | 0.0589 | 0.0807 | +8.1% | 噪声内，无增益 |
+| E1Id | +全部 intraday（11 列） | 0.0606 | 0.0768 | +10.7% | h5 微涨、h10 反降，无增益 |
+
+- 日线 tech 40 已覆盖小时线大部分信息（`vol20` ≈ rv24 折算、`ret1` ≈ mom24 折算），额外列只加方差，与 E134 的教训一致；
+- `crypto_hourly` 表保留在 DB 中供后续研究（如 funding/OI、逐币时序标签），不进入生产。
 
 ### 19.4 统一预测入口
 
