@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""自动识别代码所属市场并选择对应策略模型预测 (A股/港股/美股/期货)。
+"""自动识别代码所属市场并选择对应策略模型预测 (A股/港股/美股/期货/加密货币)。
 
 识别规则 (按顺序):
   1. A股:  6 位数字 (可带 sh/sz/bj 前缀), 在 stocks 表验证, e.g. sh600519/000001
   2. 港股: 5 位数字 (自动补齐前导 0), 在 global_codes(hk) 验证, e.g. 00700/700
   3. 美股: 字母代码, 在 global_codes(us) 验证 (标普500成分), e.g. AAPL
-  4. 期货: 字母+数字主力连续合约, 在 global_codes(fut) 验证, e.g. RB0
+  4. 加密: 字母/数字代码, 自动拼 USDT 交易对, 在 global_codes(crypto) 验证,
+           e.g. BTC -> BTCUSDT, 也可直接输入完整交易对 BTCUSDT
+  5. 期货: 字母+数字主力连续合约, 在 global_codes(fut) 验证, e.g. RB0
 
 策略选择 (按市场分开定稿, 全部同一语义: 截面跑赢当日中位数的概率, T+1 开盘执行):
-  A股  -> production/prod_h{1,5,10}_tech.txt       (生产定稿, 可用)
-  港股 -> production/prod_hk_h{1,5,10}_tech.txt    (技能最强, ICIR 2.26, 可用)
-  美股 -> production/prod_us_h{1,5,10}_tech.txt    (标普500 技术 IC≈0, 先按此使用)
-  期货 -> production/prod_fut_h{1,5,10}_tech.txt   (弱信号, 辅助参考)
+  A股  -> production/prod_h{1,5,10}_tech.txt           (生产定稿, 可用)
+  港股 -> production/prod_hk_h{1,5,10}_tech.txt        (技能最强, ICIR 2.26, 可用)
+  美股 -> production/prod_us_h{1,5,10}_tech.txt        (标普500 技术 IC≈0, 先按此使用)
+  期货 -> production/prod_fut_h{1,5,10}_tech.txt       (弱信号, 辅助参考)
+  加密 -> production/prod_crypto_h{1,5,10}_tech.txt    (h5/h10 IC 0.06-0.078, 未对冲 BTC beta)
 
 特征与训练完全一致 (tech 40 列, lgbm_train_backtest._compute_feats):
 取该市场最近约 270 个交易日全市场行情计算特征 (60 日窗口 + 截面排名),
@@ -20,8 +23,8 @@
 有可忽略的微小差异。
 
 用法:
-    python3 predict_code.py sh600519 00700 AAPL RB0
-    python3 predict_code.py 600519 700 aapl      # 自动归一化
+    python3 predict_code.py sh600519 00700 AAPL BTC RB0
+    python3 predict_code.py 600519 700 aapl btc   # 自动归一化
     python3 predict_code.py 00700 --date 2026-10-01  # 指定信号日(默认最新)
 """
 import argparse
@@ -59,9 +62,13 @@ STRATEGY = {
     "fut": ("期货", ["production/prod_fut_h1_tech.txt", "production/prod_fut_h5_tech.txt",
                      "production/prod_fut_h10_tech.txt"],
             "生产定稿三周期 tech，弱信号（IC 0.03@h10），辅助参考"),
+    "crypto": ("加密货币", ["production/prod_crypto_h1_tech.txt",
+                            "production/prod_crypto_h5_tech.txt",
+                            "production/prod_crypto_h10_tech.txt"],
+               "h5/h10 IC 0.061/0.078 中等信号；h1 受 0.2% 双边成本拖累，仅h5/h10参考；执行按次日 00:00 UTC"),
 }
 MARKET_TABLE = {"cn": "daily_bars", "hk": "hk_daily",
-                "us": "us_daily", "fut": "fut_daily"}
+                "us": "us_daily", "fut": "fut_daily", "crypto": "crypto_daily"}
 WARMUP_DAYS = 400  # 自然日, ≈270 交易日
 
 
@@ -101,13 +108,19 @@ def resolve_code(raw, con):
                        "AND code=?", (hk,)).fetchone():
             return "hk", hk
         return None, f"{raw} 未匹配港股池 (5 位港股代码)"
-    # 3/4. 美股 (字母) 与期货 (字母+数字)
+    # 3/4/5. 美股 (字母) / 加密 (字母拼 USDT) / 期货 (字母+数字)
     up = raw.upper()
     ds = None
     if re.fullmatch(r"[A-Z.\-]{1,6}", up) and \
             con.execute("SELECT 1 FROM global_codes WHERE dataset='us' "
                         "AND code=?", (up,)).fetchone():
         return "us", up
+    if re.fullmatch(r"[A-Z0-9]{1,12}", up):
+        # 加密货币: 短代码拼 USDT 交易对, 或完整交易对 (BTC -> BTCUSDT)
+        sym = up if up.endswith("USDT") else up + "USDT"
+        if con.execute("SELECT 1 FROM global_codes WHERE dataset='crypto' "
+                       "AND code=?", (sym,)).fetchone():
+            return "crypto", sym
     if re.fullmatch(r"[A-Z]{1,3}\d{1,2}", up):
         if con.execute("SELECT 1 FROM global_codes WHERE dataset='fut' "
                        "AND code=?", (up,)).fetchone():
@@ -115,7 +128,7 @@ def resolve_code(raw, con):
         ds = "fut"
     if ds:
         return None, f"{up} 不在期货主力合约池"
-    return None, f"{raw} 无法识别 (美股需在标普500池内)"
+    return None, f"{raw} 无法识别 (美股需在标普500池内, 加密需为已冻结币池内的 USDT 交易对)"
 
 
 def load_market_bars(market, start):
@@ -214,7 +227,7 @@ def fmt_p(p):
 def main():
     ap = argparse.ArgumentParser(
         description="自动识别市场并选择策略模型预测")
-    ap.add_argument("codes", nargs="*", help="代码, e.g. sh600519 00700 AAPL RB0")
+    ap.add_argument("codes", nargs="*", help="代码, e.g. sh600519 00700 AAPL BTC RB0")
     ap.add_argument("--date", default=None,
                     help="信号日 YYYY-MM-DD (默认每市场最新交易日)")
     args = ap.parse_args()

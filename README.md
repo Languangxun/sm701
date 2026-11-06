@@ -474,6 +474,7 @@ p = booster.predict(X)  # X 列序按 man["features"]
 | 港股 | `production/prod_hk_h{1,5,10}_tech.txt` | 0.5563/0.0975 · 0.5536/0.1078 · 0.5620/0.1244 | **可用**（分年 IC 0.09–0.14 最稳） |
 | 美股 | `production/prod_us_h{1,5,10}_tech.txt` | ≈0.50 / ≈0.005 | 先按此使用（标普500 技术 IC≈0，仅供参考） |
 | 期货 | `production/prod_fut_h{1,5,10}_tech.txt` | 0.5078/0.0111 · 0.5157/0.0268 · 0.5165/0.0317 | 弱信号，辅助参考 |
+| 加密 | `production/prod_crypto_h{1,5,10}_tech.txt` | 0.5258/0.0528 · 0.5316/0.0609 · 0.5402/0.0776 | h5/h10 中等信号可用（h1 承受换手成本，未做 BTC beta 对冲） |
 
 - 样本外预测文件（列同 A 股 `valid_predictions.csv.gz`）：
   `python3 production/make_predictions.py --market hk|us|fut` →
@@ -557,7 +558,8 @@ nohup python3 train_markets.py > markets.log 2>&1 &
   期货 TopK 列成本口径过重（万 15 是股票口径），无参考意义。
 - 加密 IC 随持有期单调上升（h=1 0.0528 → h=10 0.0776），但 h=1 换手成本过高；
   实盘应看 h=5/10。TopK 为多币等权、T+1 开盘执行，未做 BTC beta 对冲。
-- 模型 `markets_output/{market}_h{h}.txt`，推理同 §18；加密模型目前只用于研究回测，未复制到 `production/`。
+- 模型 `markets_output/{market}_h{h}.txt`，推理同 §18；加密模型已复制为
+  `production/prod_crypto_h{1,5,10}_tech.txt`（2026-11-06，与 `markets_output/crypto_h*.txt` 同哈希）并接入统一预测入口 `predict_code.py`。
 
 ### 19.4 统一预测入口
 
@@ -569,10 +571,11 @@ nohup python3 train_markets.py > markets.log 2>&1 &
 | 6 位数字/带 sh·sz·bj 前缀 | A股 | `production/prod_h{1,5,10}_tech.txt`（可用） |
 | 数字 1–5 位自动补零（700→00700） | 港股 | `production/prod_hk_h{1,5,10}_tech.txt`（技能最强，可用） |
 | 字母代码（AAPL，标普500池内） | 美股 | `production/prod_us_h{1,5,10}_tech.txt`（IC≈0，先按此使用） |
+| 字母（BTC）或完整交易对（BTCUSDT） | 加密 | `production/prod_crypto_h{1,5,10}_tech.txt`（h5/h10 IC 0.061/0.078；h1 受 0.2% 双边成本拖累，仅 h5/h10 参考；执行按次日 00:00 UTC） |
 | 字母+数字（RB0，主力连续） | 期货 | `production/prod_fut_h{1,5,10}_tech.txt`（弱信号，辅助参考） |
 
 ```bash
-python3 predict_code.py sh600519 00700 AAPL RB0   # 混合输入, 自动分组
+python3 predict_code.py sh600519 00700 AAPL BTC RB0   # 混合输入, 自动分组 (BTC 自动归一为 BTCUSDT)
 python3 predict_code.py 00700 --date 2026-10-01   # 指定信号日
 ```
 
