@@ -65,7 +65,7 @@ STRATEGY = {
     "crypto": ("加密货币", ["production/prod_crypto_h1_tech.txt",
                             "production/prod_crypto_h5_tech.txt",
                             "production/prod_crypto_h10_tech.txt"],
-               "h5/h10 IC 0.061/0.078 中等信号；h1 受 0.2% 双边成本拖累，仅h5/h10参考；执行按次日 00:00 UTC"),
+               "E1-beta中性标签；概率=beta调整残差跑赢截面中位数；h5/h10可用，h1受成本拖累仅参考；执行次日00:00 UTC"),
 }
 MARKET_TABLE = {"cn": "daily_bars", "hk": "hk_daily",
                 "us": "us_daily", "fut": "fut_daily", "crypto": "crypto_daily"}
@@ -261,8 +261,11 @@ def main():
         if "error" in r:
             print(f"  {r['error']}")
             continue
-        print(f"  信号日: {r['latest']}  (T+1 开盘执行; "
-              f"概率=截面跑赢当日中位数)")
+        exec_note = ("次日 00:00 UTC 开盘执行" if mkt == "crypto"
+                     else "T+1 开盘执行")
+        prob_note = ("概率=beta-调整 residual 跑赢截面中位数" if mkt == "crypto"
+                     else "概率=截面跑赢当日中位数")
+        print(f"  信号日: {r['latest']}  ({exec_note}; {prob_note})")
         for c in codes:
             d = r["results"].get(c)
             if d is None:
