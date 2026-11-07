@@ -638,7 +638,8 @@ python3 train_crypto_cost.py --variants E1,E1_cost_soft,E1_cost_double     # A3 
 （`train_markets.py` / `train_crypto_ab.py` / `train_crypto_intraday.py` / `train_crypto_cost.py`）
 都把 `lgb.early_stopping(...)` 放在 `LGBMClassifier(callbacks=...)`，实际从未生效 —— 所有模型都跑满
 `n_estimators=3000` 轮，`best_iteration_` 恒为 0（脚本 fallback 打印 3000），验证集早停形同虚设。
-A 股/港/美/期货模型同样受影响（§7.1 表中所有 best_iter=3000 均为此原因），**后续应全部重训**。
+A 股生产脚本（`lgbm_train_backtest.py` / `train_ablation.py`）用的是 `lgb.train`，早停正常
+（best_iter 1566/1998/1600）；**港股/美股/期货模型（`train_markets.py`）同样受影响**，后续应统一重训。
 
 修复：改用 `lgb.train(... callbacks=[early_stopping])`（`train_crypto_v2.py`），早停集
 2024-01 ~ 2025-12，2026 作未参与早停的 OOS。加密结果：
