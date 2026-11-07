@@ -43,6 +43,7 @@ import pandas as pd
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from lgbm_train_backtest import _compute_feats  # noqa: E402
+from train_crypto_intraday import ID_ALL, build_intraday  # noqa: E402
 
 DB = os.path.join(HERE, "stock_cache.db")
 FEAT_FILE = os.path.join(HERE, "production", "features_tech.json")
@@ -149,6 +150,30 @@ def load_market_bars(market, start):
     return df
 
 
+def load_intraday_features(latest, daily):
+    """加密: 取 latest 前 40 天的小时线, 构造与训练一致的 11 列 intraday 特征.
+
+    只用于加密模型 (>40 特征). 返回与 daily 同序的 DataFrame; 无数据时返回 None.
+    """
+    start = (pd.Timestamp(latest) - pd.Timedelta(days=40)
+             ).strftime("%Y-%m-%d 00:00")
+    con = sqlite3.connect(DB)
+    hdf = pd.read_sql_query(
+        "SELECT code, ts, open, high, low, close, vol FROM crypto_hourly "
+        "WHERE ts >= ? ORDER BY code, ts", con, params=[start])
+    con.close()
+    if hdf.empty:
+        return None
+    hdf["code"] = hdf["code"].astype(str)
+    hdf["hour"] = hdf["ts"].str[11:13].astype(int)
+    hdf["date"] = hdf["ts"].str[:10]
+    idf = build_intraday(hdf)[["code", "date"] + ID_ALL]
+    keys = pd.DataFrame({"code": daily["code"].astype(str).values,
+                         "date": daily["date"].values})
+    idm = keys.merge(idf, on=["code", "date"], how="left")
+    return idm[ID_ALL].reset_index(drop=True)
+
+
 def predict_market(market, codes, on_date=None):
     name, models, note = STRATEGY[market]
     con = sqlite3.connect(DB)
@@ -180,6 +205,13 @@ def predict_market(market, codes, on_date=None):
                       for k in FEATS}, dtype=np.float32)
     del F
     gc.collect()
+    if market == "crypto":
+        # h=10 生产模型带 11 列 intraday 特征, 统一拼上 (40 列模型会按名取列)
+        hid = load_intraday_features(latest, df)
+        if hid is not None:
+            X = pd.concat([X.reset_index(drop=True), hid], axis=1)
+        else:
+            log("警告: crypto_hourly 无近期数据, intraday 特征缺失 (h10 预测退化)")
 
     codes_arr = df["code"].astype(str).to_numpy()
     dates_arr = df["date"].to_numpy()
@@ -197,7 +229,7 @@ def predict_market(market, codes, on_date=None):
     probs = {}
     for h, path in zip((1, 5, 10), models):
         b = lgb.Booster(model_file=os.path.join(HERE, path))
-        probs[h] = b.predict(X).astype(np.float32)
+        probs[h] = b.predict(X[b.feature_name()]).astype(np.float32)
     del X
     gc.collect()
     prob_mean = (probs[1] + probs[5] + probs[10]) / 3.0

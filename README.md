@@ -474,7 +474,7 @@ p = booster.predict(X)  # X 列序按 man["features"]
 | 港股 | `production/prod_hk_h{1,5,10}_tech.txt` | 0.5563/0.0975 · 0.5536/0.1078 · 0.5620/0.1244 | **可用**（分年 IC 0.09–0.14 最稳） |
 | 美股 | `production/prod_us_h{1,5,10}_tech.txt` | ≈0.50 / ≈0.005 | 先按此使用（标普500 技术 IC≈0，仅供参考） |
 | 期货 | `production/prod_fut_h{1,5,10}_tech.txt` | 0.5078/0.0111 · 0.5157/0.0268 · 0.5165/0.0317 | 弱信号，辅助参考 |
-| 加密 | `production/prod_crypto_h{1,5,10}_tech.txt` | 0.5278/0.0550 · 0.5309/0.0596 · 0.5396/0.0791（E1 beta 中性标签） | h5/h10 residual 信号可用；h1 承受换手成本，仅作参考 |
+| 加密 | `production/prod_crypto_h{1,5,10}_tech.txt` | 0.5424/0.0826 · 0.5471/0.0892 · 0.5521/0.1076（E1 beta 中性 + 修复早停；h10 含 intraday） | h10 可用（2026 OOS IC 0.067，Top10 +11.1%）；h1/h5 成本后仍负 |
 
 - 样本外预测文件（列同 A 股 `valid_predictions.csv.gz`）：
   `python3 production/make_predictions.py --market hk|us|fut` →
@@ -544,14 +544,28 @@ python3 train_markets.py --markets hk --limit 60                        # 冒烟
 nohup python3 train_markets.py > markets.log 2>&1 &
 ```
 
-**加密生产口径（`train_crypto_ab.py --variants E1`，beta 中性标签，2026-11-06 审计）**：
+**加密生产口径（2026-11-07 重训：E1 beta 中性标签 + 正确早停）**：
 
 ```bash
-python3 train_crypto_ab.py --variants E1 --horizons 1,5,10
+# h1/h5: tech40; h10: tech40+11 列 intraday (需 crypto_hourly 已更新)
+python3 train_crypto_v2.py --variants E1_auc --horizons 1,5
+python3 train_crypto_id_v2.py --variants E1Id --horizons 10
+# 产物: markets_output/crypto_v2_E1_auc_h{1,5}.txt, crypto_idv2_E1Id_h10.txt
+# 复制为 production/prod_crypto_h{1,5,10}_tech.txt
 ```
 
-加密生产模型（`production/prod_crypto_h{1,5,10}_tech.txt`）由当前 `markets_output/crypto_ab_E1_h{h}.txt` 复制；
-其标签语义为 beta-调整残差（`R_ex = R_h − β90d·R_btc` 跑赢截面中位数），非「截面跑赢中位数」——§19.4 中加密概率含义随之改口。
+> ⚠️ 早停必须用 `lgb.train(callbacks=[early_stopping])`；LightGBM 4.7 的
+> `LGBMClassifier(callbacks=...)` 会被静默忽略（详见 §19.3.3）。
+
+**加密方法消融脚本**（均基于修复后的早停协议）：
+
+```bash
+python3 train_crypto_rankic.py --variants E1,A1_32,A1_64 --horizons 5,10   # A1 LambdaRankIC
+python3 train_crypto_ts.py --variants E1_auc,A8_pos,A8_vol,A8_ex --horizons 5,10  # A8 时序标签
+python3 train_crypto_hpo.py --trials 40 --horizon 10 --features id         # A9 超参搜索
+python3 stack_crypto.py --horizon 10                                        # A10 Stacking
+python3 train_crypto_cost.py --variants E1,E1_cost_soft,E1_cost_double     # A3 成本标签
+```
 
 ### 19.3 结果（2026-11-05 初版定稿，验证集 2024-01 ~ 2026-11）
 
@@ -567,9 +581,12 @@ python3 train_crypto_ab.py --variants E1 --horizons 1,5,10
 | 加密（初版 base） | T+1 | 0.5258 | 0.0528 | 0.36 | 日频被 0.2% 双边成本吃掉，Top10 净年化 −36.5% |
 | 加密（初版 base） | T+5 | 0.5316 | 0.0609 | 0.42 | 信号增强，Top10 净年化 +15.5% |
 | 加密（初版 base） | T+10 | 0.5402 | 0.0776 | 0.53 | 三周期最强；分年 IC 0.079/0.079/0.074，Top10 净年化 +33.5% |
-| 加密（E1 生产） | T+1 | 0.5278 | **0.0550**† | 0.39 | residual 口径；Top10 residual 净年化 −46.4%，h1 仍不可交易 |
-| 加密（E1 生产） | T+5 | 0.5309 | **0.0596**† | **0.43** | 分年 IC 0.078/0.040/0.062；Top10 residual 净年化 −3.1% |
-| 加密（E1 生产） | T+10 | 0.5396 | **0.0791**† | **0.55** | 分年 IC 0.104/0.065/0.067；Top10 residual 净年化 +11.2% |
+| 加密（旧 E1，3000 轮无早停） | T+1 | 0.5278 | 0.0550† | 0.39 | 已被 §19.3.3 取代；Top10 residual 净年化 −46.4% |
+| 加密（旧 E1，3000 轮无早停） | T+5 | 0.5309 | 0.0596† | 0.43 | 已被 §19.3.3 取代；Top10 residual 净年化 −3.1% |
+| 加密（旧 E1，3000 轮无早停） | T+10 | 0.5396 | 0.0791† | 0.55 | 已被 §19.3.3 取代；Top10 residual 净年化 +11.2% |
+| **加密（新生产，正确早停）** | T+1 | 0.5424 | **0.0826**† | 0.46 | 2026 OOS IC 0.0665；Top10 仍 −43.5%（不可交易） |
+| **加密（新生产，正确早停）** | T+5 | 0.5471 | **0.0892**† | 0.51 | 2026 OOS IC 0.0716；Top10 仍 −9.8% |
+| **加密（新生产，正确早停）** | T+10 | 0.5521 | **0.1076**† | 0.62 | 含 11 列 intraday；2026 OOS IC 0.0674，Top10 **+11.1%** |
 
 † E1 的 IC 为对 residual 收益 `R_ex = R_h − β90d·R_btc` 的 Spearman（评价口径与初版 base 对 raw R 的 IC 不可直接比；base 在同一 R_ex 口径下 h5/h10 分别为 0.0550/0.0735）。
 
@@ -583,6 +600,9 @@ python3 train_crypto_ab.py --variants E1 --horizons 1,5,10
   `production/prod_crypto_h{1,5,10}_tech.txt`（2026-11-06，E1 标签版，与 `markets_output/crypto_ab_E1_h*.txt` 同哈希）并接入统一预测入口 `predict_code.py`。
 
 ### 19.3.1 加密方法消融（2026-11-06，beta 中性评价口径）
+
+> 本节实验在早停修复前完成（所有模型实际跑满 3000 轮），**绝对数值已被 §19.3.3 取代**；
+> 但「E1 > base、E3/E4 为负」的方向性结论在修复后仍成立。
 
 `train_crypto_ab.py` 在同一 splits（训练 2018–2023 / 验证 2024+）、同一特征基准（tech 40）下消融：
 
@@ -598,22 +618,54 @@ python3 train_crypto_ab.py --variants E1 --horizons 1,5,10
   建议后续若再加特征，先做 drop-one 单变量消融（②），不要批量加列。
 - h1 在所有口径下 Top10 净年化均为负（base −69.4% → E1 −46.4%），确认为**不可交易**而非标签问题；h1 生产模型保留供参考，不作选币使用。
 
-### 19.3.2 加密分时细节（hourly）消融（2026-11-07，阴性结果）
+### 19.3.2 加密分时细节（hourly）消融（2026-11-07）
 
-数据：`crypto_hourly`（§19.1），375 万行 1h K 线。`train_crypto_intraday.py` 在 E1 口径下加日内特征：
+数据：`crypto_hourly`（§19.1），375 万行 1h K 线。`train_crypto_id_v2.py` 在 E1 口径 + **修复后的早停**下加日内特征：
 
-| 变种 | 特征 | h=5 IC_Rex | h=10 IC_Rex | Top10_ann_net(h10) | 结论 |
+| 变种 | 特征 | h=5 IC_Rex | h=10 IC_Rex | h10 分年 IC（24/25/26） | Top10_ann_net(h10) | 结论 |
+|---|---|---|---|---|---|---|
+| E1_auc | tech40 | 0.0892 | 0.1008 | 0.127/0.107/0.060 | +11.4% | 基准 |
+| E1Rv | +rv24/rv168/mom4/mom8（4 列） | 0.0941 | 0.1036 | 0.134/0.103/0.067 | +13.5% | h5 小幅提升，h10 稳定 |
+| **E1Id** | **+全部 intraday（11 列）** | 0.0917 | **0.1076** | **0.136/0.112/0.067** | **+15.1%** | **h10 生产采用（三年度一致提升）** |
+
+- **此前 §19.3.2 的阴性结论是早停失效导致的误判**：当时两个模型都跑满 3000 轮，掩盖了 intraday 特征的正向作用；
+- h10 的增益在 2024/2025/2026 三年均一致（+0.009/+0.004/+0.007 IC），不是单年噪声；h5 基本无增益，维持 tech40；
+- 推理侧 `predict_code.py` 会读取最近 40 天 `crypto_hourly` 计算 11 列 intraday 特征；**需保持小时线表更新**，否则 h10 特征缺失会退化。
+
+### 19.3.3 早停修复与重训（2026-11-07，关键修复）
+
+**根因**：LightGBM 4.7 的 sklearn 接口会**静默忽略**构造函数里的 `callbacks`。仓库所有脚本
+（`train_markets.py` / `train_crypto_ab.py` / `train_crypto_intraday.py` / `train_crypto_cost.py`）
+都把 `lgb.early_stopping(...)` 放在 `LGBMClassifier(callbacks=...)`，实际从未生效 —— 所有模型都跑满
+`n_estimators=3000` 轮，`best_iteration_` 恒为 0（脚本 fallback 打印 3000），验证集早停形同虚设。
+A 股/港/美/期货模型同样受影响（§7.1 表中所有 best_iter=3000 均为此原因），**后续应全部重训**。
+
+修复：改用 `lgb.train(... callbacks=[early_stopping])`（`train_crypto_v2.py`），早停集
+2024-01 ~ 2025-12，2026 作未参与早停的 OOS。加密结果：
+
+| 周期 | 旧（3000 轮，无早停） | 新（正确早停） | 最优轮数 | 2026 OOS IC | Top10_26 净年化 |
 |---|---|---|---|---|---|
-| E1 | tech40 | 0.0596 | 0.0791 | +11.2% | 生产（不升级） |
-| E1Rv | +rv24/rv168/mom4/mom8（4 列） | 0.0589 | 0.0807 | +8.1% | 噪声内，无增益 |
-| E1Id | +全部 intraday（11 列） | 0.0606 | 0.0768 | +10.7% | h5 微涨、h10 反降，无增益 |
+| h1 | IC 0.0550 | **0.0826** | 120 | 0.0665 | −43.5%（仍不可交易） |
+| h5 | IC 0.0596 | **0.0892** | 36 | 0.0716 | −9.8%（成本后仍负） |
+| h10 | IC 0.0791 | **0.1076**（+intraday） | 110 | 0.0674 | **+11.1%** |
 
-- 日线 tech 40 已覆盖小时线大部分信息（`vol20` ≈ rv24 折算、`ret1` ≈ mom24 折算），额外列只加方差，与 E134 的教训一致；
-- `crypto_hourly` 表保留在 DB 中供后续研究（如 funding/OI、逐币时序标签），不进入生产。
+同批方法在修复后复测的结论：
+
+| 方法 | 结果 | 处置 |
+|---|---|---|
+| A1 LambdaRankIC（`train_crypto_rankic.py`） | h5/h10 全验证集 IC 略高（0.0909/0.0995），但 2026 OOS 仅 0.048–0.061，且单次训练慢 ~50 倍 | **放弃** |
+| A8 逐币时序标签（`train_crypto_ts.py`） | 对 R_ex 的 IC 仅 0.02–0.035，主要学到 BTC beta 方向 | **放弃** |
+| A9 随机超参搜索（`train_crypto_hpo.py`，70 组） | 2025 选择集最优配置在 2026 OOS 无稳定增益（换早停窗口后优势消失） | **放弃，维持默认超参** |
+| A10 Stacking（`stack_crypto.py`） | 等权 rank 融合 IC 0.0682 / Top10_26 +15.3%（vs E1Id 0.0674/+11.1%），IC 增益在噪声内 | **不进入生产**（保留脚本） |
+| A3 成本感知标签（`train_crypto_cost.py`） | 三种权重/硬门槛均使 IC 下降或转负（详见 §19.3.1 之前实验） | **放弃** |
+
+生产模型（`production/prod_crypto_h{1,5,10}_tech.txt`）对应：
+`markets_output/crypto_v2_E1_auc_h1.txt`、`crypto_v2_E1_auc_h5.txt`、`crypto_idv2_E1Id_h10.txt`，
+训练 2018–2023、早停 2024–2025、默认超参（lr 0.03 / leaves 31 / min_data 1000 / ff 0.6 / bag 0.7 / l2 20）。
 
 ### 19.4 统一预测入口
 
-`predict_code.py`：输入任意代码，自动识别市场并选择对应策略模型。概率语义为空：
+`predict_code.py`：输入任意代码，自动识别市场并选择对应策略模型。概率语义为：
 **A股/港/美/期货 = 截面跑赢当日中位数的概率**，T+1 开盘执行；
 **加密 = beta-调整残差 `R_ex` 跑赢截面中位数的概率**，次日 00:00 UTC 执行（§19.3.1 E1 标签）；附当日截面分位。
 
@@ -622,7 +674,7 @@ python3 train_crypto_ab.py --variants E1 --horizons 1,5,10
 | 6 位数字/带 sh·sz·bj 前缀 | A股 | `production/prod_h{1,5,10}_tech.txt`（可用） |
 | 数字 1–5 位自动补零（700→00700） | 港股 | `production/prod_hk_h{1,5,10}_tech.txt`（技能最强，可用） |
 | 字母代码（AAPL，标普500池内） | 美股 | `production/prod_us_h{1,5,10}_tech.txt`（IC≈0，先按此使用） |
-| 字母（BTC）或完整交易对（BTCUSDT） | 加密 | `production/prod_crypto_h{1,5,10}_tech.txt`（E1 beta中性标签；概率=残差跑赢截面中位数；h5/h10 residual IC 0.0596/0.0791 可用，h1 成本不可覆盖仅参考；执行按次日 00:00 UTC） |
+| 字母（BTC）或完整交易对（BTCUSDT） | 加密 | `production/prod_crypto_h{1,5,10}_tech.txt`（E1 beta中性标签 + 修复早停；h10 另用 11 列 intraday 特征；2026 OOS IC 0.067/0.072/0.067；h1/h5 成本后仍负，h10 Top10 +11.1%；执行按次日 00:00 UTC） |
 | 字母+数字（RB0，主力连续） | 期货 | `production/prod_fut_h{1,5,10}_tech.txt`（弱信号，辅助参考） |
 
 ```bash
@@ -632,6 +684,7 @@ python3 predict_code.py 00700 --date 2026-10-01   # 指定信号日
 
 实现：按市场取最近约 270 个交易日**全市场**行情算特征（tech 40 列，截面排名限当日；
 EMA 类递推指标 270 日预热，与全历史差异可忽略），取目标代码最新一行过对应模型。
+加密 h10 模型额外读取最近 40 天 `crypto_hourly` 计算 11 列 intraday 特征（需保持小时线表更新）。
 
 ### 19.5 已知限制
 
@@ -640,4 +693,5 @@ EMA 类递推指标 270 日预热，与全历史差异可忽略），取目标�
 3. 港股池为新浪全量（含大量仙股/低流动性），未按成交额过滤；美股仅标普 500 成分（当前快照，有幸存者偏差——2024+ 验证集影响小，2018–2023 训练段用的是「今天还在指数里」的名单）；
 4. 期货 82 个合约的每日截面较小，cross_binary 中位数稳定性一般；也可改做逐合约时序标签（未实现）；
 5. 加密池为「当前」24h 成交额前 100 且有 ≥250 天历史的币种，同样存在当前快照/幸存者偏差，且币种轮换会让历史截面在早期偏小（2018 年日均仅 4 个币，2019 年后才逐步可用）；未做退市币回填；
-6. 加密日线按 UTC 切日、7×24 连续交易，与股票 T+1 日历不同；回测按每日收盘出信号、次日 00:00 UTC 开盘执行，未建模资金费率/滑点/交易所差异；E1 的 residual 目标已消除 BTC beta 对 IC 的主导，但 TopK residual 年化仍未含费用资金费率之外的组合再平衡滑点与做空/做多约束；加密 TopK 未做 BTC beta 对冲的初版数值见 §19.3，生产口径（E1）以 residual 年化为准。
+6. 加密日线按 UTC 切日、7×24 连续交易，与股票 T+1 日历不同；回测按每日收盘出信号、次日 00:00 UTC 开盘执行，未建模资金费率/滑点/交易所差异；E1 的 residual 目标已消除 BTC beta 对 IC 的主导，但 TopK residual 年化仍未含资金费率之外的组合再平衡滑点与做空/做多约束；加密 TopK 未做 BTC beta 对冲的初版数值见 §19.3，生产口径（E1）以 residual 年化为准；
+7. **早停缺陷已确认并修复（§19.3.3），但仅加密已重训**：港股/美股/期货的生产模型仍是「3000 轮无早停」版本，预计同样存在过拟合，建议按 `train_crypto_v2.py` 的 `lgb.train + early_stopping` 方式统一重训后再更新 §18 表格。

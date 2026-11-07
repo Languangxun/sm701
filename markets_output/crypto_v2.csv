@@ -1,0 +1,2 @@
+variant,h,best_iter,auc_full,ic_full,icir_full,ic24,ic25,ic26,ic26_oos,top10_full,top10_26,secs
+E1_auc,1,120,0.5424,0.0826,0.459,0.1069,0.0718,0.0665,0.0665,-0.4394,-0.4345,7.6
